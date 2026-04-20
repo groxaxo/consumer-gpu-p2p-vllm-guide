@@ -101,9 +101,9 @@ pip install vllm
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 \
   NCCL_IB_DISABLE=1 \
-  NCCL_P2P_DISABLE=0 \
+  NCCL_P2P_DISABLE=1 \
   NCCL_SHM_DISABLE=0 \
-  VLLM_SKIP_P2P_CHECK=0 \
+  VLLM_SKIP_P2P_CHECK=1 \
   vllm serve Qwen/Qwen3.6-35B-A3B-FP8 \
     --tensor-parallel-size 2 \
     --gpu-memory-utilization 0.92 \
@@ -111,21 +111,95 @@ CUDA_VISIBLE_DEVICES=0,1 \
     --max-model-len 32768
 ```
 
-## What NOT to Set
+## What to Set (and Why)
 
-These are stale workarounds from before the hardware limitation was understood.
-**Do not use them** — they break auto-detection:
+### For production (recommended — fastest):
 
 ```bash
-# ❌ WRONG — prevents NCCL from probing transport capabilities
-NCCL_P2P_DISABLE=1
+NCCL_P2P_DISABLE=1        # Skip P2P probe — 10-15% faster TPOT
+VLLM_SKIP_P2P_CHECK=1     # Skip vLLM P2P cache generation — saves 5s startup
+```
 
-# ❌ WRONG — hides real P2P failures instead of letting vLLM handle them
-VLLM_SKIP_P2P_CHECK=1
+Benchmarks show explicitly disabling P2P gives 10–15% better throughput because
+NCCL optimizes the SHM transport path when it knows P2P isn't available.
 
+### For initial validation (first-time setup):
+
+```bash
+NCCL_P2P_DISABLE=0        # Let NCCL probe — confirms fallback works
+VLLM_SKIP_P2P_CHECK=0     # Let vLLM test P2P — confirms auto-detection
+```
+
+Use this once to verify everything works, then switch to the production config.
+
+### Do not use:
+
+```bash
 # ❌ WRONG — vLLM disables custom all-reduce automatically when needed
 --disable-custom-all-reduce
 ```
+
+## Benchmarks
+
+Tested with `Qwen/Qwen3.6-35B-A3B-FP8` (MoE, FP8) on 2x RTX 3090 via vLLM 0.19.0.
+Two configurations compared:
+
+- **P2P Auto-detect**: `NCCL_P2P_DISABLE=0` — NCCL probes P2P, fails, falls back to SHM
+- **P2P Disabled**: `NCCL_P2P_DISABLE=1` — NCCL skips P2P probe, uses SHM directly
+
+### Short Prompts (64 in / 64 out, sequential)
+
+| Metric | P2P Auto-detect | P2P Disabled | Delta |
+|---|---:|---:|---:|
+| TTFT (median) | 75.2 ms | 68.8 ms | **-8.5%** |
+| TPOT (median) | 47.7 ms | 42.6 ms | **-10.7%** |
+| Throughput | 197 tok/s | 231 tok/s | **+17%** |
+
+### Medium Prompts (512 in / 256 out, sequential)
+
+| Metric | P2P Auto-detect | P2P Disabled | Delta |
+|---|---:|---:|---:|
+| TTFT (median) | 76.2 ms | 69.5 ms | **-8.8%** |
+| TPOT (median) | 46.8 ms | 43.0 ms | **-8.1%** |
+| Throughput | 203 tok/s | 227 tok/s | **+12%** |
+
+### Concurrent (256 in / 128 out, 4 concurrent)
+
+| Metric | P2P Auto-detect | P2P Disabled | Delta |
+|---|---:|---:|---:|
+| TTFT (median) | 194 ms | 136 ms | **-30%** |
+| TPOT (median) | 52.8 ms | 45.3 ms | **-14%** |
+| Throughput | 174 tok/s | 217 tok/s | **+24%** |
+
+### Long Sequences (1024 in / 512 out, sequential)
+
+| Metric | P2P Auto-detect | P2P Disabled | Delta |
+|---|---:|---:|---:|
+| TTFT (median) | 204 ms | 103 ms | **-50%** |
+| TPOT (median) | 58.1 ms | 42.9 ms | **-26%** |
+| Throughput | 48 tok/s | 115 tok/s | **+142%** |
+
+> **Note**: The long-sequence P2P auto-detect test showed high variance (TPOT
+> 46–105 ms) while P2P disabled was rock-stable (42.7–43.2 ms). The variance
+> likely comes from NCCL's fallback path struggling with larger KV-cache
+> working sets.
+
+### Startup Time
+
+| Config | Cold start to ready |
+|---|---|
+| P2P Auto-detect | ~92 s (includes ~5 s P2P cache generation) |
+| P2P Disabled | ~86 s |
+
+### Takeaway
+
+**Explicitly disabling P2P is 10–15% faster for typical workloads and up to
+40%+ faster under concurrent/long-sequence loads.** When you know your hardware
+can't do BAR P2P, tell NCCL upfront — it optimizes the SHM path more
+aggressively and avoids per-token fallback overhead.
+
+For production use, set `NCCL_P2P_DISABLE=1` and `VLLM_SKIP_P2P_CHECK=1`. For
+initial validation, leave them at 0 to confirm auto-detection works, then switch.
 
 ## Key Findings
 
@@ -183,13 +257,22 @@ Two GPUs on the **same CPU PEG controller** (e.g., 00:01.0 and 00:01.1) might
 theoretically support P2P, but this is untested and may still not work on
 consumer platforms.
 
-## Could True P2P Help Performance?
+## Could True BAR P2P Help Performance?
 
-On this setup, NCCL SHM transport achieves ~6 GB/s between GPUs (DMA through
-host RAM). True BAR P2P would be faster for small-message all-reduce operations
-(lower latency), but for the large tensor shards in vLLM TP inference, the
-throughput difference is modest. The bottleneck is typically compute, not
-inter-GPU bandwidth.
+With NCCL P2P explicitly disabled (SHM-only transport), vLLM achieves
+**~43 ms TPOT** (23 tok/s per GPU) with the Qwen3.6-35B-A3B MoE model.
+That's ~231 tok/s aggregate throughput for sequential short prompts, and
+~227 tok/s for medium prompts — on two consumer RTX 3090s.
+
+True BAR P2P (e.g., behind a PLX switch or on Threadripper/EPYC) would:
+- Reduce per-token latency by eliminating the host RAM bounce
+- Enable vLLM's custom all-reduce kernel (lower-overhead than NCCL)
+- Likely improve concurrent throughput significantly (less host bus contention)
+
+On this Intel setup, the DMI 3.0 x4 link between CPU and PCH is the
+bottleneck for SHM transport when both GPUs are on PCH root ports.
+The two GPUs used for TP=2 here are GPU0 (CPU PEG) and GPU1 (PCH),
+so data crosses the DMI bridge on every all-reduce step.
 
 ## Scripts
 
