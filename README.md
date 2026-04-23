@@ -57,6 +57,22 @@ PCH lanes (cross DMI bridge):
 
 ## Quick Start
 
+### One-command installer
+
+```bash
+python3 install.py
+```
+
+This automates the documented setup flow:
+
+- installs the OS prerequisites
+- builds and installs the patched NVIDIA driver
+- writes the GRUB and NVIDIA module settings
+- creates `~/venvs/vllm` and installs `vllm`
+
+Use `--dry-run` to preview the actions, or `--skip-driver`, `--skip-grub`, and
+`--skip-vllm` to limit what gets changed.
+
 ### 1. Install the patched driver
 
 ```bash
@@ -278,6 +294,7 @@ so data crosses the DMI bridge on every all-reduce step.
 
 | Script | Purpose |
 |---|---|
+| [`install.py`](install.py) | Interactive autoinstaller for the full setup |
 | [`scripts/manage_vllm_safe_tp2.sh`](scripts/manage_vllm_safe_tp2.sh) | Canonical vLLM launcher with boot arg gates |
 | [`scripts/require-gpu-pair.sh`](scripts/require-gpu-pair.sh) | Pre-flight check for TP=2 GPU pair |
 | [`scripts/post-reboot-test.sh`](scripts/post-reboot-test.sh) | Full post-reboot validation (boot args + NCCL test) |
