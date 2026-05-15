@@ -34,6 +34,8 @@ Environment overrides:
   VLLM_LOG_DIR                    Log directory
   VLLM_RUN_DIR                    PID directory
   VLLM_STARTUP_TIMEOUT_SECONDS    Startup wait timeout (180)
+  VLLM_UNSLOTH_ARGS               Optional custom Unsloth-style args (space-separated)
+  VLLM_USE_UNSLOTH_DEFAULTS       1 to add built-in Unsloth-style defaults (default 1)
   VLLM_MOE_BACKEND                Optional explicit MoE backend
   VLLM_USE_QWEN_TOOLING_DEFAULTS  1 to add qwen3 parser/tool flags (default 1)
 EOF
@@ -46,7 +48,8 @@ if [[ -z "$ACTION" ]]; then
 fi
 shift || true
 
-DEFAULT_MODEL="Qwen/Qwen3.6-35B-A3B-FP8"
+QWEN_DEFAULT_MODEL="Qwen/Qwen3.6-35B-A3B-FP8"
+DEFAULT_MODEL="/models/122b"
 MODEL="${VLLM_MODEL:-$DEFAULT_MODEL}"
 
 if [[ "$ACTION" == "start" || "$ACTION" == "restart" || "$ACTION" == "status" || "$ACTION" == "health" || "$ACTION" == "stop" ]]; then
@@ -66,6 +69,8 @@ LOG_DIR="${VLLM_LOG_DIR:-/home/op/logs}"
 RUN_DIR="${VLLM_RUN_DIR:-/home/op/.openjaw/run}"
 STARTUP_TIMEOUT_SECONDS="${VLLM_STARTUP_TIMEOUT_SECONDS:-180}"
 USE_QWEN_DEFAULTS="${VLLM_USE_QWEN_TOOLING_DEFAULTS:-1}"
+USE_UNSLOTH_DEFAULTS="${VLLM_USE_UNSLOTH_DEFAULTS:-1}"
+UNSLOTH_ARGS="${VLLM_UNSLOTH_ARGS:-}"
 
 MODEL_SLUG="$(printf '%s' "$MODEL" | tr '/: ' '___' | tr -cd 'A-Za-z0-9._-')"
 PID_FILE="${RUN_DIR}/${MODEL_SLUG}-tp2-safe-${PORT}.pid"
@@ -73,7 +78,7 @@ LOG_FILE="${LOG_DIR}/${MODEL_SLUG}-tp2-safe-${PORT}.log"
 HEALTH_URL="http://127.0.0.1:${PORT}/v1/models"
 
 qwen_extra_args=()
-if [[ "$USE_QWEN_DEFAULTS" == "1" && "$MODEL" == "$DEFAULT_MODEL" ]]; then
+if [[ "$USE_QWEN_DEFAULTS" == "1" && "$MODEL" == "$QWEN_DEFAULT_MODEL" ]]; then
   qwen_extra_args=(
     --moe-backend marlin
     --reasoning-parser qwen3
@@ -82,6 +87,19 @@ if [[ "$USE_QWEN_DEFAULTS" == "1" && "$MODEL" == "$DEFAULT_MODEL" ]]; then
   )
 elif [[ -n "${VLLM_MOE_BACKEND:-}" ]]; then
   qwen_extra_args=(--moe-backend "$VLLM_MOE_BACKEND")
+fi
+
+unsloth_extra_args=()
+if [[ -n "$UNSLOTH_ARGS" ]]; then
+  read -r -a unsloth_extra_args <<< "$UNSLOTH_ARGS"
+elif [[ "$USE_UNSLOTH_DEFAULTS" == "1" ]]; then
+  unsloth_extra_args=(
+    --dtype auto
+    --kv-cache-dtype auto
+    --enable-prefix-caching
+    --max-num-batched-tokens 2048
+    --max-num-seqs 16
+  )
 fi
 
 is_running() {
@@ -185,6 +203,7 @@ start_server() {
     --enforce-eager
   )
   cmd+=("${qwen_extra_args[@]}")
+  cmd+=("${unsloth_extra_args[@]}")
   cmd+=("$@")
 
   (

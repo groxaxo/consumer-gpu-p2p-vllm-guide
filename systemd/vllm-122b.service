@@ -1,0 +1,28 @@
+[Unit]
+Description=vLLM TP2 service for /models/122b
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=op
+WorkingDirectory=/home/op
+Environment=CUDA_DEVICE_ORDER=PCI_BUS_ID
+Environment=CUDA_VISIBLE_DEVICES=0,1
+Environment=OMP_NUM_THREADS=1
+Environment=GLOO_SOCKET_IFNAME=lo
+Environment=NCCL_IB_DISABLE=1
+Environment=NCCL_P2P_DISABLE=0
+Environment=NCCL_SHM_DISABLE=0
+Environment=VLLM_SKIP_P2P_CHECK=0
+Environment=VLLM_MARLIN_USE_ATOMIC_ADD=1
+ExecStart=/home/op/venvs/vllm-qwen36/bin/vllm serve /models/122b --host 0.0.0.0 --port 1240 --tensor-parallel-size 2 --max-model-len 32768 --gpu-memory-utilization 0.92 --generation-config vllm --disable-log-stats --enforce-eager --moe-backend marlin --dtype auto --kv-cache-dtype auto --enable-prefix-caching --max-num-batched-tokens 2048 --max-num-seqs 16
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=600
+KillSignal=SIGTERM
+StandardOutput=append:/home/op/logs/vllm-122b-service.log
+StandardError=append:/home/op/logs/vllm-122b-service.log
+
+[Install]
+WantedBy=multi-user.target

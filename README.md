@@ -57,62 +57,48 @@ PCH lanes (cross DMI bridge):
 
 ## Quick Start
 
-### One-command installer
-
 ```bash
+git clone https://github.com/groxaxo/consumer-gpu-p2p-vllm-guide.git
+cd consumer-gpu-p2p-vllm-guide
 python3 install.py
 ```
 
-This automates the documented setup flow:
+That is the only command you need. The installer will:
 
-- installs the OS prerequisites
-- builds and installs the patched NVIDIA driver
-- writes the GRUB and NVIDIA module settings
-- creates `~/venvs/vllm` and installs `vllm`
+1. Bootstrap `asciimatics` automatically if it is not installed
+2. Show you a plan of what will change and ask for confirmation
+3. Launch a full-screen animated display while the installation runs in the background
+4. Install OS prerequisites (`apt`)
+5. Clone, compile, and install the patched NVIDIA P2P driver
+6. Patch GRUB boot args and write `/etc/modprobe.d/nvidia.conf`
+7. Create `~/venvs/vllm` and install vLLM
+8. Print the full install log on completion (or on error)
 
-Use `--dry-run` to preview the actions, or `--skip-driver`, `--skip-grub`, and
-`--skip-vllm` to limit what gets changed.
+**Flags:**
 
-### 1. Install the patched driver
+| Flag | Effect |
+|---|---|
+| `--dry-run` | Show what would happen — make no changes |
+| `--yes` | Skip the confirmation prompt |
+| `--skip-driver` | Skip driver clone + build |
+| `--skip-grub` | Skip GRUB / modprobe changes |
+| `--skip-vllm` | Skip venv + vLLM install |
+| `--driver-dir PATH` | Override driver checkout location |
+| `--venv-dir PATH` | Override venv location |
 
-```bash
-git clone -b 595.58.03-p2p https://github.com/aikitoria/open-gpu-kernel-modules.git
-cd open-gpu-kernel-modules
-make -j$(nproc) modules
-sudo make modules_install
-sudo depmod -a
-```
-
-### 2. Configure boot args
-
-Edit `/etc/default/grub`:
-
-```
-GRUB_CMDLINE_LINUX_DEFAULT="... intel_iommu=on iommu=pt pci=noaer pcie_aspm=off"
-```
+After install, **reboot** and validate:
 
 ```bash
-sudo update-grub
-sudo reboot
+bash scripts/post-reboot-test.sh
 ```
 
-### 3. Set driver registry key
-
-Create `/etc/modprobe.d/nvidia.conf`:
-
-```
-options nvidia NVreg_RegistryDwords="RMForceP2PType=0"
-```
-
-### 4. Install vLLM
+Then launch vLLM:
 
 ```bash
-python -m venv ~/venvs/vllm
-source ~/venvs/vllm/bin/activate
-pip install vllm
+bash scripts/manage_vllm_safe_tp2.sh start
 ```
 
-### 5. Launch with TP=2
+### Launch with TP=2 manually
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 \
@@ -126,6 +112,9 @@ CUDA_VISIBLE_DEVICES=0,1 \
     --enforce-eager \
     --max-model-len 32768
 ```
+
+> **Manual steps** (what the installer does under the hood) are documented in
+> [`docs/`](docs/) for reference.
 
 ## What to Set (and Why)
 

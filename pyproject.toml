@@ -1,0 +1,11 @@
+[project]
+name = "consumer-gpu-p2p-vllm-guide"
+version = "1.0.0"
+description = "Patched NVIDIA P2P driver + vLLM installer for consumer GPUs"
+requires-python = ">=3.9"
+dependencies = [
+    "asciimatics>=1.14",
+]
+
+[project.scripts]
+install-p2p = "install:main"
