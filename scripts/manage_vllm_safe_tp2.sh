@@ -92,6 +92,7 @@ if [[ "$USE_QWEN_DEFAULTS" == "1" && "$MODEL" == "$QWEN_DEFAULT_MODEL" ]]; then
     --reasoning-parser qwen3
     --enable-auto-tool-choice
     --tool-call-parser qwen3_coder
+    --language-model-only
   )
 fi
 
