@@ -49,7 +49,7 @@ fi
 shift || true
 
 QWEN_DEFAULT_MODEL="Qwen/Qwen3.6-35B-A3B-FP8"
-DEFAULT_MODEL="/models/122b"
+DEFAULT_MODEL="$QWEN_DEFAULT_MODEL"
 MODEL="${VLLM_MODEL:-$DEFAULT_MODEL}"
 
 if [[ "$ACTION" == "start" || "$ACTION" == "restart" || "$ACTION" == "status" || "$ACTION" == "health" || "$ACTION" == "stop" ]]; then
