@@ -48,7 +48,7 @@ if [[ -z "$ACTION" ]]; then
 fi
 shift || true
 
-QWEN_DEFAULT_MODEL="Qwen/Qwen3.6-35B-A3B-FP8"
+QWEN_DEFAULT_MODEL="Qwen/Qwen3.5-9B"
 DEFAULT_MODEL="$QWEN_DEFAULT_MODEL"
 MODEL="${VLLM_MODEL:-$DEFAULT_MODEL}"
 
@@ -80,7 +80,6 @@ HEALTH_URL="http://127.0.0.1:${PORT}/v1/models"
 qwen_extra_args=()
 if [[ "$USE_QWEN_DEFAULTS" == "1" && "$MODEL" == "$QWEN_DEFAULT_MODEL" ]]; then
   qwen_extra_args=(
-    --moe-backend marlin
     --reasoning-parser qwen3
     --enable-auto-tool-choice
     --tool-call-parser qwen3_coder
