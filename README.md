@@ -299,6 +299,51 @@ so data crosses the DMI bridge on every all-reduce step.
 | [`scripts/require-gpu-pair.sh`](scripts/require-gpu-pair.sh) | Pre-flight check for TP=2 GPU pair |
 | [`scripts/post-reboot-test.sh`](scripts/post-reboot-test.sh) | Full post-reboot validation (boot args + NCCL test) |
 | [`scripts/test_nccl_tp2.py`](scripts/test_nccl_tp2.py) | Standalone NCCL all-reduce test |
+| [`scripts/p2p_bandwidth_bench.py`](scripts/p2p_bandwidth_bench.py) | **Full P2P + PCIe bandwidth benchmark** (compiles + runs CUDA benchmark, emits system report) |
+| [`scripts/p2p_bandwidth_bench.cu`](scripts/p2p_bandwidth_bench.cu) | CUDA benchmark source (unidirectional, bidirectional, latency, all GPU pairs) |
+
+## P2P Bandwidth Benchmark
+
+Run a full diagnostic across all GPU pairs:
+
+```bash
+python3 scripts/p2p_bandwidth_bench.py
+# optionally save results
+python3 scripts/p2p_bandwidth_bench.py --save bench_results.txt
+```
+
+The benchmark measures:
+- **Unidirectional bandwidth** at 1 / 16 / 64 / 256 MiB transfer sizes
+- **Bidirectional bandwidth** (simultaneous both directions)
+- **Round-trip latency** (4-byte ping, 200 rounds)
+- **Host↔Device baseline** per GPU
+- **P2P vs CPU-bounce comparison** for every pair where P2P is available
+
+It also prints a full system context header: driver version, PCIe link state
+(`lspci LnkSta`), `nvidia-smi topo`, and GPU inventory — so you can paste the
+entire output as a single reproducible report.
+
+### Why PCIe slot assignment matters
+
+On Intel consumer platforms the DMI link (CPU ↔ PCH) and the number of CPU-attached
+PEG lanes are both finite. A mixed 3090+3060 rig on Z690/B660 will typically end
+up with some cards on PCH root ports running at **x1** even though the slot is
+physically x16. Example from a real 5-GPU system:
+
+| GPU | Card | PCIe link | P2P bandwidth |
+|---|---|---|---|
+| GPU0 | RTX 3090 | Gen4 x8 (CPU PEG) | ~6.6 GB/s |
+| GPU1 | RTX 3090 | Gen4 x4 (PCH) | ~6.6 GB/s |
+| GPU2 | RTX 3060 | **Gen1 x1 (PCH)** | **~0.8 GB/s** |
+| GPU3 | RTX 3060 | **Gen1 x1 (PCH)** | **~0.8 GB/s** |
+| GPU4 | RTX 3090 | Gen4 x4 (CPU PEG) | ~6.6 GB/s |
+
+The 3060s physically support Gen3 x16 but the PCH slots were bandwidth-starved.
+The benchmark `[Summary & Recommendations]` section flags pairs below threshold
+and prints the relevant `lspci` command to investigate.
+
+**Fix**: move GPUs to CPU PEG slots, or use a PCIe bifurcation riser to give
+both cards at least x4 each from a single x16 slot.
 
 ## License
 
