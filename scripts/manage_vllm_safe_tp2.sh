@@ -77,6 +77,15 @@ PID_FILE="${RUN_DIR}/${MODEL_SLUG}-tp2-safe-${PORT}.pid"
 LOG_FILE="${LOG_DIR}/${MODEL_SLUG}-tp2-safe-${PORT}.log"
 HEALTH_URL="http://127.0.0.1:${PORT}/v1/models"
 
+# Returns true when the model name looks like a quantized MoE model.
+# Heuristic: active-param suffix (-A<N>B, e.g. -A3B, -A22B) AND a
+# quantization token (FP8, GPTQ, AWQ, INT4, INT8, W4, W8).
+# Full-precision MoE models (no quant token) do NOT match.
+_is_quantized_moe() {
+  local m="${1,,}"
+  [[ "$m" =~ -a[0-9]+b ]] && [[ "$m" =~ (fp8|gptq|awq|int4|int8|w4|w8|bnb) ]]
+}
+
 qwen_extra_args=()
 if [[ "$USE_QWEN_DEFAULTS" == "1" && "$MODEL" == "$QWEN_DEFAULT_MODEL" ]]; then
   qwen_extra_args=(
@@ -84,8 +93,15 @@ if [[ "$USE_QWEN_DEFAULTS" == "1" && "$MODEL" == "$QWEN_DEFAULT_MODEL" ]]; then
     --enable-auto-tool-choice
     --tool-call-parser qwen3_coder
   )
-elif [[ -n "${VLLM_MOE_BACKEND:-}" ]]; then
-  qwen_extra_args=(--moe-backend "$VLLM_MOE_BACKEND")
+fi
+
+# MoE backend: explicit env override wins; otherwise auto-detect from model name.
+# --moe-backend marlin is only appropriate for quantized MoE models.
+# Full-precision (FP16/BF16) dense or MoE models should use the vLLM default.
+if [[ -n "${VLLM_MOE_BACKEND:-}" ]]; then
+  qwen_extra_args+=(--moe-backend "$VLLM_MOE_BACKEND")
+elif _is_quantized_moe "$MODEL"; then
+  qwen_extra_args+=(--moe-backend marlin)
 fi
 
 unsloth_extra_args=()
