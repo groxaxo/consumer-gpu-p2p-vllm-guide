@@ -266,15 +266,87 @@ def _ensure_driver_repo(driver_dir: Path, dry_run: bool) -> None:
         )
 
 
-def _build_and_install_driver(driver_dir: Path, dry_run: bool) -> None:
-    _set_msg("Compiling NVIDIA kernel module... (5-10 min)")
-    _run(
-        ["make", f"-j{os.cpu_count() or 1}", "modules"],
-        cwd=driver_dir,
-        dry_run=dry_run,
+DKMS_PACKAGE = "nvidia-p2p"
+DKMS_SRC_DIR = Path(f"/usr/src/{DKMS_PACKAGE}-{PATCHED_DRIVER_VERSION}")
+DKMS_CONF = """PACKAGE_NAME="{pkg}"
+PACKAGE_VERSION="{ver}"
+AUTOINSTALL="yes"
+
+MAKE[0]="'make' -j$(nproc) NV_EXCLUDE_BUILD_MODULES='' KERNEL_UNAME=${{kernelver}} modules"
+
+BUILT_MODULE_NAME[0]="nvidia"
+BUILT_MODULE_LOCATION[0]="kernel-open"
+DEST_MODULE_LOCATION[0]="/kernel/drivers/video"
+
+BUILT_MODULE_NAME[1]="nvidia-uvm"
+BUILT_MODULE_LOCATION[1]="kernel-open"
+DEST_MODULE_LOCATION[1]="/kernel/drivers/video"
+
+BUILT_MODULE_NAME[2]="nvidia-modeset"
+BUILT_MODULE_LOCATION[2]="kernel-open"
+DEST_MODULE_LOCATION[2]="/kernel/drivers/video"
+
+BUILT_MODULE_NAME[3]="nvidia-drm"
+BUILT_MODULE_LOCATION[3]="kernel-open"
+DEST_MODULE_LOCATION[3]="/kernel/drivers/video"
+
+BUILT_MODULE_NAME[4]="nvidia-peermem"
+BUILT_MODULE_LOCATION[4]="kernel-open"
+DEST_MODULE_LOCATION[4]="/kernel/drivers/video"
+""".format(pkg=DKMS_PACKAGE, ver=PATCHED_DRIVER_VERSION)
+
+
+def _dkms_registered() -> bool:
+    """True if `dkms status` already shows our nvidia-p2p package."""
+    result = subprocess.run(
+        ["dkms", "status", "-m", DKMS_PACKAGE, "-v", PATCHED_DRIVER_VERSION],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
     )
-    _set_msg("Installing NVIDIA kernel module...")
-    _run_privileged(["make", "modules_install"], cwd=driver_dir, dry_run=dry_run)
+    return bool(result.stdout.strip())
+
+
+def _build_and_install_driver(driver_dir: Path, dry_run: bool) -> None:
+    """Register the patched driver source with DKMS so apt-installed kernel
+    upgrades automatically rebuild it. DKMS is the only mechanism that makes
+    `apt upgrade` safe for an out-of-tree NVIDIA driver."""
+    _set_msg(f"Staging driver source at {DKMS_SRC_DIR}...")
+    # Refresh the staged source from the checked-out git tree so we always
+    # build the current branch contents.
+    _run_privileged(["rm", "-rf", str(DKMS_SRC_DIR)], dry_run=dry_run)
+    _run_privileged(["cp", "-a", str(driver_dir), str(DKMS_SRC_DIR)],
+                    dry_run=dry_run)
+    # Clean any prior in-tree build artifacts that would confuse DKMS.
+    _run_privileged(["make", "-C", str(DKMS_SRC_DIR), "clean"], dry_run=dry_run)
+    if not dry_run:
+        tmp = Path("/tmp/nvidia-p2p-dkms.conf")
+        tmp.write_text(DKMS_CONF)
+        _run_privileged(
+            ["install", "-o", "root", "-g", "root", "-m", "0644",
+             str(tmp), str(DKMS_SRC_DIR / "dkms.conf")],
+            dry_run=False,
+        )
+        tmp.unlink(missing_ok=True)
+
+    if _dkms_registered():
+        _set_msg("DKMS module already registered; removing for clean rebuild...")
+        _run_privileged(
+            ["dkms", "remove", "-m", DKMS_PACKAGE,
+             "-v", PATCHED_DRIVER_VERSION, "--all"],
+            dry_run=dry_run,
+        )
+    _set_msg(f"Registering {DKMS_PACKAGE} with DKMS...")
+    _run_privileged(["dkms", "add", "-m", DKMS_PACKAGE,
+                     "-v", PATCHED_DRIVER_VERSION], dry_run=dry_run)
+
+    _set_msg("Building patched kernel modules via DKMS... (5-10 min)")
+    _run_privileged(["dkms", "build", "-m", DKMS_PACKAGE,
+                     "-v", PATCHED_DRIVER_VERSION], dry_run=dry_run)
+
+    _set_msg("Installing patched kernel modules via DKMS...")
+    _run_privileged(["dkms", "install", "-m", DKMS_PACKAGE,
+                     "-v", PATCHED_DRIVER_VERSION, "--force"], dry_run=dry_run)
     _set_msg("Running depmod...")
     _run_privileged(["depmod", "-a"], dry_run=dry_run)
 
@@ -374,32 +446,16 @@ def _installed_nvidia_pkgs() -> list[str]:
 
 
 def _apply_apt_holds(dry_run: bool) -> None:
-    """Lock down apt so `apt upgrade` cannot break the patched P2P driver.
+    """Lock down apt's *userspace* nvidia/NCCL packages.
 
-    - Hold the running kernel + headers + generic meta-packages so apt won't
-      install a new kernel and orphan the patched modules.
-    - Hold libnccl2/libnccl-dev (newer NCCL versions can disable P2P paths).
-    - Hold any currently-installed nvidia-*/libnvidia-* packages so they
-      cannot be replaced with a newer userspace that mismatches our kernel
-      module.
+    We do NOT hold the kernel: DKMS rebuilds the patched modules on every
+    kernel upgrade, so kernel upgrades are safe. We DO hold:
+    - libnccl2/libnccl-dev — newer NCCL releases can disable P2P codepaths.
+    - All currently-installed nvidia-*/libnvidia-* packages — apt-installed
+      userspace would replace the .run-installed libs and mismatch our DKMS
+      kernel module ("Driver/library version mismatch").
     """
-    _set_msg("Applying apt holds (kernel + NCCL + nvidia)...")
-    kver = platform.release()
-    kernel_holds = [
-        f"linux-image-{kver}",
-        f"linux-headers-{kver}",
-        f"linux-modules-{kver}",
-        f"linux-modules-extra-{kver}",
-        "linux-image-generic",
-        "linux-headers-generic",
-        "linux-generic",
-    ]
-    for pkg in kernel_holds:
-        if _pkg_installed(pkg):
-            _run_privileged(["apt-mark", "hold", pkg], dry_run=dry_run)
-        else:
-            _log(f"{pkg} is not installed; skipping hold.")
-
+    _set_msg("Applying apt holds (NCCL + nvidia userspace)...")
     for pkg in ("libnccl2", "libnccl-dev"):
         if _pkg_installed(pkg):
             _run_privileged(["apt-mark", "hold", pkg], dry_run=dry_run)
@@ -769,7 +825,8 @@ def main() -> int:
     if not args.skip_driver:
         planned += [
             f"Clone {DRIVER_BRANCH} from {DRIVER_REPO}",
-            "Compile and install the patched NVIDIA kernel module",
+            f"Register driver source with DKMS ({DKMS_PACKAGE}-{PATCHED_DRIVER_VERSION})",
+            "Build and install patched kernel modules via DKMS",
         ]
     if not args.skip_grub:
         planned += [
@@ -779,7 +836,7 @@ def main() -> int:
         ]
     if not args.skip_lockdown:
         planned += [
-            "Hold kernel + nvidia + libnccl2 packages (apt-mark hold)",
+            "Hold nvidia userspace + libnccl2 packages (apt-mark hold)",
             f"Install apt pin at {APT_PIN_PATH}",
             f"Install healthcheck at {HEALTHCHECK_PATH}",
             f"Stash NVIDIA-Linux-x86_64-{PATCHED_DRIVER_VERSION}.run to "
