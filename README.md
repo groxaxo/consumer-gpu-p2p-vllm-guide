@@ -70,11 +70,33 @@ That is the only command you need. The installer will:
 2. Show you a plan of what will change and ask for confirmation
 3. Launch a full-screen animated display while the installation runs in the background
 4. Install OS prerequisites (`apt`)
-5. Clone, compile, and install the patched NVIDIA P2P driver
-6. Patch GRUB boot args and write `/etc/modprobe.d/nvidia.conf`
-7. Run `apt-mark hold libnccl2` when the system NCCL package is present
-8. Create `~/venvs/vllm` and install a CUDA 12.8 vLLM stack via `uv`
-9. Print the full install log on completion (or on error)
+5. Clone the patched NVIDIA P2P driver source
+6. **Register the driver with DKMS** so kernel upgrades auto-rebuild it
+7. Patch GRUB boot args and write `/etc/modprobe.d/nvidia.conf`
+8. Lock down apt (`apt-mark hold` + `/etc/apt/preferences.d/00-nvidia-p2p-pin`) so userspace `nvidia-*` / `libnccl*` packages can't replace the `.run`-installed driver
+9. Stash the `.run` installer at `/opt/nvidia-p2p/` and install `/usr/local/sbin/p2p-healthcheck`
+10. Create `~/venvs/vllm` and install a CUDA 12.8 vLLM stack via `uv`
+11. Print the full install log on completion (or on error)
+
+### Surviving `apt upgrade`
+
+Out-of-tree NVIDIA drivers normally die the next time you run
+`sudo apt upgrade`, because a new kernel lands without matching modules. This
+installer fixes that by:
+
+- **DKMS** rebuilds the patched 595.58.03 modules (signed with your MOK key,
+  Secure Boot–compatible) every time apt installs a new kernel — *before* you
+  reboot.
+- An **apt preferences pin** with `Pin-Priority: -1` blocks any new
+  `nvidia-driver-*` / `libnvidia-compute-*` / `linux-modules-nvidia-*` package
+  from landing as a transitive dependency.
+- **apt-mark hold** freezes the currently-installed userspace `nvidia-*` /
+  `libnccl*` packages so a new CUDA-13 NCCL or stock NVIDIA driver can't
+  replace them.
+
+Result: `sudo apt update && sudo apt upgrade` is safe to run any time. Verify
+with `sudo p2p-healthcheck`. See [docs/08-lockdown.md](docs/08-lockdown.md) for
+full details and the recovery procedure.
 
 **Flags:**
 
@@ -82,9 +104,10 @@ That is the only command you need. The installer will:
 |---|---|
 | `--dry-run` | Show what would happen — make no changes |
 | `--yes` | Skip the confirmation prompt |
-| `--skip-driver` | Skip driver clone + build |
+| `--skip-driver` | Skip driver clone + DKMS build |
 | `--skip-grub` | Skip GRUB / modprobe changes |
 | `--skip-vllm` | Skip venv + vLLM install |
+| `--skip-lockdown` | Skip apt holds, apt pin, healthcheck, `.run` stash |
 | `--driver-dir PATH` | Override driver checkout location |
 | `--venv-dir PATH` | Override venv location |
 
