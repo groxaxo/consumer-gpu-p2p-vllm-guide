@@ -3,10 +3,24 @@
 ## Installation
 
 ```bash
-python3 -m venv ~/venvs/vllm
-source ~/venvs/vllm/bin/activate
-pip install vllm
+python3 -m pip install --user uv
+uv venv ~/venvs/vllm
+uv pip install --python ~/venvs/vllm/bin/python \
+  --index-url https://download.pytorch.org/whl/cu128 \
+  torch==2.11.0+cu128 \
+  torchvision==0.26.0+cu128 \
+  torchaudio==2.11.0+cu128
+uv pip install --python ~/venvs/vllm/bin/python vllm==0.21.0
 ```
+
+Verify the runtime resolves to CUDA 12.x before using it:
+
+```bash
+~/venvs/vllm/bin/python -c 'import torch, vllm; print(torch.__version__, torch.version.cuda, vllm.__version__)'
+```
+
+Do **not** use plain `pip install vllm` here — on this stack it can resolve to
+CUDA 13 wheels, which violates the guide's CUDA 12.x requirement.
 
 ## Running with TP=2
 

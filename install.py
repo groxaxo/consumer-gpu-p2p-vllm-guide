@@ -9,6 +9,7 @@ it is not already installed.
 Usage:
     python3 install.py [--yes] [--dry-run]
                        [--skip-driver] [--skip-grub] [--skip-vllm]
+                       [--skip-lockdown]
                        [--driver-dir PATH] [--venv-dir PATH]
 """
 from __future__ import annotations
@@ -34,6 +35,13 @@ DRIVER_REPO    = "https://github.com/aikitoria/open-gpu-kernel-modules.git"
 DRIVER_BRANCH  = "595.58.03-p2p"
 DEFAULT_DRIVER_DIR = Path("~/src/open-gpu-kernel-modules").expanduser()
 DEFAULT_VENV_DIR   = Path("~/venvs/vllm").expanduser()
+VLLM_TORCH_INDEX_URL = "https://download.pytorch.org/whl/cu128"
+VLLM_TORCH_PACKAGES = [
+    "torch==2.11.0+cu128",
+    "torchvision==0.26.0+cu128",
+    "torchaudio==2.11.0+cu128",
+]
+VLLM_PACKAGE = "vllm==0.21.0"
 
 REQUIRED_APT_PACKAGES = [
     "build-essential",
@@ -52,6 +60,49 @@ REQUIRED_GRUB_ARGS = [
     "pcie_aspm=off",
 ]
 NVIDIA_MODPROBE_CONF = 'options nvidia NVreg_RegistryDwords="RMForceP2PType=0"\n'
+
+# Lockdown: prevent apt from upgrading kernels (would orphan our patched modules)
+# or replacing the .run-installed userspace driver.
+PATCHED_DRIVER_VERSION = "595.58.03"
+NVIDIA_RUN_STASH_DIR = Path("/opt/nvidia-p2p")
+APT_PIN_PATH = Path("/etc/apt/preferences.d/00-nvidia-p2p-pin")
+APT_PIN_CONTENT = """# Block apt-installed NVIDIA drivers from overwriting the patched
+# 595.58.03 .run install. Managed by install.py — delete this file
+# if you intentionally want to upgrade the driver.
+
+Package: nvidia-driver-* nvidia-dkms-* libnvidia-compute-* libnvidia-decode-* libnvidia-encode-* libnvidia-extra-* libnvidia-fbc1-* libnvidia-gl-* nvidia-kernel-source-* nvidia-kernel-common-* nvidia-utils-* xserver-xorg-video-nvidia-* linux-modules-nvidia-*
+Pin: release *
+Pin-Priority: -1
+"""
+HEALTHCHECK_PATH = Path("/usr/local/sbin/p2p-healthcheck")
+HEALTHCHECK_SCRIPT = """#!/usr/bin/env bash
+# Verifies the patched P2P driver kernel module and userspace match.
+# Exit 0 = healthy, 1 = problem. Installed by install.py.
+set -u
+EXPECT="{version}"
+
+KMOD_VER=$(modinfo nvidia 2>/dev/null | awk '/^version:/ {{print $2}}')
+NVRM_VER=$(awk '/NVRM version/ {{for (i=1;i<=NF;i++) if ($i ~ /^[0-9]+\\.[0-9]+\\.[0-9]+$/) print $i}}' /proc/driver/nvidia/version 2>/dev/null | head -1)
+SMI_OUT=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>&1 | head -1)
+
+echo "kernel module version (modinfo): $KMOD_VER"
+echo "loaded kernel module (NVRM):     $NVRM_VER"
+echo "nvidia-smi userspace:            $SMI_OUT"
+
+fail=0
+[ "$KMOD_VER" = "$EXPECT" ] || {{ echo "FAIL: modinfo nvidia is not $EXPECT"; fail=1; }}
+[ "$NVRM_VER" = "$EXPECT" ] || {{ echo "FAIL: loaded NVRM is not $EXPECT (reboot may be needed)"; fail=1; }}
+echo "$SMI_OUT" | grep -q "$EXPECT" || {{ echo "FAIL: nvidia-smi mismatch (got: $SMI_OUT)"; fail=1; }}
+
+if [ $fail -eq 0 ]; then
+  echo ""
+  echo "P2P matrix:"
+  nvidia-smi topo -p2p r 2>&1 | sed -E 's/\\x1b\\[[0-9;]*m//g' | head -20
+  echo ""
+  echo "OK: P2P driver healthy ($EXPECT)"
+fi
+exit $fail
+""".format(version=PATCHED_DRIVER_VERSION)
 
 
 # ─── shared install state (written by worker thread, read by animation) ───────
@@ -95,6 +146,24 @@ def _ensure_asciimatics() -> None:
         )
         # Re-exec so the fresh import succeeds
         os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+def _ensure_uv() -> list[str]:
+    uv_cmd = [sys.executable, "-m", "uv"]
+    try:
+        subprocess.run(
+            [*uv_cmd, "--version"],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.STDOUT,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        print("[*] uv not found — installing it now...")
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--quiet", "uv"],
+            check=True,
+        )
+    return uv_cmd
 
 
 # ─── error type ───────────────────────────────────────────────────────────────
@@ -276,21 +345,214 @@ def _update_boot_config(dry_run: bool) -> None:
     _run_privileged(["update-initramfs", "-u"], dry_run=dry_run)
 
 
+def _pkg_installed(pkg: str) -> bool:
+    result = subprocess.run(
+        ["dpkg-query", "-W", "-f=${Status}", pkg],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    return "install ok installed" in result.stdout
+
+
+def _installed_nvidia_pkgs() -> list[str]:
+    result = subprocess.run(
+        ["dpkg-query", "-W", "-f=${Package}\\t${Status}\\n"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    out: list[str] = []
+    for line in (result.stdout or "").splitlines():
+        parts = line.split("\t")
+        if len(parts) != 2 or "install ok installed" not in parts[1]:
+            continue
+        name = parts[0].split(":")[0]
+        if re.match(r"^(nvidia|libnvidia|xserver-xorg-video-nvidia)", name):
+            out.append(name)
+    return out
+
+
+def _apply_apt_holds(dry_run: bool) -> None:
+    """Lock down apt so `apt upgrade` cannot break the patched P2P driver.
+
+    - Hold the running kernel + headers + generic meta-packages so apt won't
+      install a new kernel and orphan the patched modules.
+    - Hold libnccl2/libnccl-dev (newer NCCL versions can disable P2P paths).
+    - Hold any currently-installed nvidia-*/libnvidia-* packages so they
+      cannot be replaced with a newer userspace that mismatches our kernel
+      module.
+    """
+    _set_msg("Applying apt holds (kernel + NCCL + nvidia)...")
+    kver = platform.release()
+    kernel_holds = [
+        f"linux-image-{kver}",
+        f"linux-headers-{kver}",
+        f"linux-modules-{kver}",
+        f"linux-modules-extra-{kver}",
+        "linux-image-generic",
+        "linux-headers-generic",
+        "linux-generic",
+    ]
+    for pkg in kernel_holds:
+        if _pkg_installed(pkg):
+            _run_privileged(["apt-mark", "hold", pkg], dry_run=dry_run)
+        else:
+            _log(f"{pkg} is not installed; skipping hold.")
+
+    for pkg in ("libnccl2", "libnccl-dev"):
+        if _pkg_installed(pkg):
+            _run_privileged(["apt-mark", "hold", pkg], dry_run=dry_run)
+        else:
+            _log(f"{pkg} is not installed; skipping hold.")
+
+    nvidia_pkgs = _installed_nvidia_pkgs()
+    if nvidia_pkgs:
+        _run_privileged(["apt-mark", "hold", *nvidia_pkgs], dry_run=dry_run)
+    else:
+        _log("No nvidia-* apt packages installed; skipping nvidia holds.")
+
+
+def _needs_root_write(path: Path, content: str) -> bool:
+    try:
+        return path.read_text() != content
+    except (FileNotFoundError, PermissionError):
+        return True
+
+
+def _install_apt_pin(dry_run: bool) -> None:
+    """Drop an apt preferences pin so apt-installed nvidia/kernel-module
+    packages can never replace the .run-installed userspace driver."""
+    _set_msg("Installing apt pin to block nvidia package installs...")
+    if not _needs_root_write(APT_PIN_PATH, APT_PIN_CONTENT):
+        _log(f"{APT_PIN_PATH} already up to date.")
+        return
+    if dry_run:
+        _log(f"[dry-run] would write {APT_PIN_PATH}")
+        return
+    # Stage in /tmp then move via sudo (current user may not have write perms).
+    tmp = Path("/tmp/00-nvidia-p2p-pin")
+    tmp.write_text(APT_PIN_CONTENT)
+    _run_privileged(["install", "-o", "root", "-g", "root", "-m", "0644",
+                     str(tmp), str(APT_PIN_PATH)], dry_run=False)
+    tmp.unlink(missing_ok=True)
+
+
+def _install_healthcheck(dry_run: bool) -> None:
+    """Install /usr/local/sbin/p2p-healthcheck so the user can verify the
+    driver state at any time."""
+    _set_msg("Installing p2p-healthcheck script...")
+    if not _needs_root_write(HEALTHCHECK_PATH, HEALTHCHECK_SCRIPT):
+        _log(f"{HEALTHCHECK_PATH} already up to date.")
+        return
+    if dry_run:
+        _log(f"[dry-run] would write {HEALTHCHECK_PATH}")
+        return
+    tmp = Path("/tmp/p2p-healthcheck")
+    tmp.write_text(HEALTHCHECK_SCRIPT)
+    _run_privileged(["install", "-o", "root", "-g", "root", "-m", "0755",
+                     str(tmp), str(HEALTHCHECK_PATH)], dry_run=False)
+    tmp.unlink(missing_ok=True)
+
+
+def _stash_run_installer(dry_run: bool) -> None:
+    """Copy the .run installer to /opt/nvidia-p2p so it survives /home
+    cleanups and can be re-applied after any accidental userspace overwrite."""
+    candidates = [
+        Path.home() / f"NVIDIA-Linux-x86_64-{PATCHED_DRIVER_VERSION}.run",
+        Path(f"/tmp/NVIDIA-Linux-x86_64-{PATCHED_DRIVER_VERSION}.run"),
+    ]
+    src = next((p for p in candidates if p.exists()), None)
+    dest = NVIDIA_RUN_STASH_DIR / f"NVIDIA-Linux-x86_64-{PATCHED_DRIVER_VERSION}.run"
+    if dest.exists():
+        _log(f"{dest} already present; not re-stashing.")
+        return
+    if src is None:
+        _log(f"No NVIDIA-Linux-x86_64-{PATCHED_DRIVER_VERSION}.run found in "
+             f"~ or /tmp; skipping stash to {NVIDIA_RUN_STASH_DIR}.")
+        return
+    _set_msg(f"Stashing {src.name} to {NVIDIA_RUN_STASH_DIR}...")
+    if dry_run:
+        _log(f"[dry-run] would copy {src} -> {dest}")
+        return
+    _run_privileged(["mkdir", "-p", str(NVIDIA_RUN_STASH_DIR)], dry_run=False)
+    _run_privileged(["cp", str(src), str(dest)], dry_run=False)
+    _run_privileged(["chmod", "755", str(dest)], dry_run=False)
+    _run_privileged(["chown", "root:root", str(dest)], dry_run=False)
+
+
+def _apply_lockdown(dry_run: bool) -> None:
+    """Lock the system so `apt upgrade`/`apt update` cannot break P2P."""
+    _apply_apt_holds(dry_run=dry_run)
+    _install_apt_pin(dry_run=dry_run)
+    _install_healthcheck(dry_run=dry_run)
+    _stash_run_installer(dry_run=dry_run)
+
+
+def _verify_vllm_cuda12(venv_python: Path) -> None:
+    result = subprocess.run(
+        [
+            str(venv_python),
+            "-c",
+            (
+                "import torch, vllm; "
+                "print(torch.__version__); "
+                "print(torch.version.cuda or ''); "
+                "print(vllm.__version__)"
+            ),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    for line in (result.stdout or "").splitlines():
+        _log(line)
+    if result.returncode != 0:
+        raise InstallerError("vLLM environment verification failed.")
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if len(lines) < 3:
+        raise InstallerError("Could not determine the installed vLLM CUDA version.")
+    cuda_version = lines[-2]
+    try:
+        cuda_major = int(cuda_version.split(".", 1)[0])
+    except (TypeError, ValueError):
+        raise InstallerError(f"Unexpected CUDA version string: {cuda_version!r}") from None
+    if cuda_major >= 13:
+        raise InstallerError(
+            f"vLLM resolved to CUDA {cuda_version}. Expected CUDA 12.x; aborting."
+        )
+
+
 def _install_vllm(venv_dir: Path, dry_run: bool) -> None:
-    _set_msg("Creating Python virtual environment...")
-    _run(["python3", "-m", "venv", str(venv_dir)], dry_run=dry_run)
+    uv_cmd = _ensure_uv()
     venv_python = venv_dir / "bin" / "python"
-    _set_msg("Upgrading pip...")
+    if venv_python.exists():
+        _set_msg(f"Reusing existing virtual environment at {venv_dir}...")
+    else:
+        _set_msg("Creating Python virtual environment...")
+        _run([*uv_cmd, "venv", str(venv_dir)], dry_run=dry_run)
+    _set_msg("Installing PyTorch CUDA 12.8...")
     _run(
-        [str(venv_python), "-m", "pip", "install", "--upgrade",
-         "pip", "setuptools", "wheel"],
+        [
+            *uv_cmd,
+            "pip",
+            "install",
+            "--python",
+            str(venv_python),
+            "--index-url",
+            VLLM_TORCH_INDEX_URL,
+            *VLLM_TORCH_PACKAGES,
+        ],
         dry_run=dry_run,
     )
     _set_msg("Installing vLLM (large download, please wait)...")
     _run(
-        [str(venv_python), "-m", "pip", "install", "vllm"],
+        [*uv_cmd, "pip", "install", "--python", str(venv_python), VLLM_PACKAGE],
         dry_run=dry_run,
     )
+    if not dry_run:
+        _set_msg("Verifying vLLM resolved to CUDA 12.x...")
+        _verify_vllm_cuda12(venv_python)
 
 
 def _make_scripts_executable(repo_root: Path, dry_run: bool) -> None:
@@ -315,6 +577,9 @@ def _run_installation(args: argparse.Namespace, repo_root: Path) -> None:
 
         if not args.skip_grub:
             _update_boot_config(dry_run=args.dry_run)
+
+        if not args.skip_lockdown:
+            _apply_lockdown(dry_run=args.dry_run)
 
         if not args.skip_vllm:
             _install_vllm(args.venv_dir.expanduser(), dry_run=args.dry_run)
@@ -472,6 +737,8 @@ def _parse_args() -> argparse.Namespace:
                    help="Skip GRUB and modprobe config changes.")
     p.add_argument("--skip-vllm",    action="store_true",
                    help="Skip venv creation and vLLM install.")
+    p.add_argument("--skip-lockdown", action="store_true",
+                   help="Skip apt holds, apt pin, healthcheck, and .run stashing.")
     p.add_argument("--driver-dir",   type=Path, default=DEFAULT_DRIVER_DIR,
                    help=f"Driver checkout path (default: {DEFAULT_DRIVER_DIR}).")
     p.add_argument("--venv-dir",     type=Path, default=DEFAULT_VENV_DIR,
@@ -510,8 +777,18 @@ def main() -> int:
             "Write /etc/modprobe.d/nvidia.conf (RMForceP2PType=0)",
             "Run update-grub + update-initramfs",
         ]
+    if not args.skip_lockdown:
+        planned += [
+            "Hold kernel + nvidia + libnccl2 packages (apt-mark hold)",
+            f"Install apt pin at {APT_PIN_PATH}",
+            f"Install healthcheck at {HEALTHCHECK_PATH}",
+            f"Stash NVIDIA-Linux-x86_64-{PATCHED_DRIVER_VERSION}.run to "
+            f"{NVIDIA_RUN_STASH_DIR} (if present)",
+        ]
     if not args.skip_vllm:
-        planned.append(f"Create venv at {args.venv_dir} and install vLLM")
+        planned.append(
+            f"Create venv at {args.venv_dir} and install CUDA 12.8 + vLLM via uv"
+        )
 
     print()
     print("  Consumer GPU P2P Driver Installer")

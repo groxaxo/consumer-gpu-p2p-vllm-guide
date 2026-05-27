@@ -54,6 +54,7 @@ PCH lanes (cross DMI bridge):
 5. [Production Launcher Script](docs/05-launcher.md)
 6. [Ollama Multi-GPU](docs/06-ollama.md)
 7. [Troubleshooting](docs/07-troubleshooting.md)
+8. [Lockdown: Surviving `apt upgrade`](docs/08-lockdown.md)
 
 ## Quick Start
 
@@ -71,8 +72,9 @@ That is the only command you need. The installer will:
 4. Install OS prerequisites (`apt`)
 5. Clone, compile, and install the patched NVIDIA P2P driver
 6. Patch GRUB boot args and write `/etc/modprobe.d/nvidia.conf`
-7. Create `~/venvs/vllm` and install vLLM
-8. Print the full install log on completion (or on error)
+7. Run `apt-mark hold libnccl2` when the system NCCL package is present
+8. Create `~/venvs/vllm` and install a CUDA 12.8 vLLM stack via `uv`
+9. Print the full install log on completion (or on error)
 
 **Flags:**
 

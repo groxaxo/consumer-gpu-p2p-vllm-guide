@@ -108,8 +108,9 @@ sudo efibootmgr
 Ubuntu may have installed a stock NVIDIA driver that conflicts:
 
 ```bash
-dpkg -l | grep nvidia-driver
-sudo apt-mark hold nvidia-driver-*
+dpkg -l | grep -E 'nvidia-(driver|open)'
+sudo apt-mark hold nvidia-driver-\* nvidia-open-\*
+sudo apt-mark hold libnccl2
 sudo rmmod nvidia_drm nvidia_modeset nvidia_uvm nvidia
 sudo modprobe nvidia
 modinfo nvidia | grep version

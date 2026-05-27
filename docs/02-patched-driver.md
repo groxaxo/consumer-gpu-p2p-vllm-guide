@@ -65,8 +65,16 @@ disable for non-datacenter GPUs.
 To prevent Ubuntu from overwriting the patched driver with an update:
 
 ```bash
-sudo apt-mark hold nvidia-driver-535
-# Or whichever package provides the stock driver
+dpkg -l | grep -E 'nvidia-(driver|open)'
+sudo apt-mark hold nvidia-driver-\* nvidia-open-\*
+```
+
+If you also install system NCCL from the NVIDIA apt repo, hold that too so it
+does not drift onto a CUDA 13.x build while the rest of the stack stays on
+CUDA 12.x:
+
+```bash
+sudo apt-mark hold libnccl2
 ```
 
 ## Compatibility

@@ -31,7 +31,7 @@ echo "Caches cleared"
 
 echo ""
 echo "=== Step 4: NCCL SHM all-reduce test (${CUDA_DEVICES}) ==="
-CUDA_VISIBLE_DEVICES="$CUDA_DEVICES" "$VLLM_VENV_PATH/bin/python" -c "
+CUDA_VISIBLE_DEVICES="$CUDA_DEVICES" "$VLLM_VENV_PATH/bin/python" - <<'PY'
 import os, torch, torch.distributed as dist, torch.multiprocessing as mp
 
 def worker(rank, world_size):
@@ -56,7 +56,8 @@ def worker(rank, world_size):
             raise SystemExit(1)
     dist.destroy_process_group()
 
-mp.spawn(worker, args=(2,), nprocs=2, join=True)
-"
+if __name__ == '__main__':
+    mp.start_processes(worker, args=(2,), nprocs=2, join=True, start_method='fork')
+PY
 echo ""
 echo "=== All post-reboot checks passed ==="
