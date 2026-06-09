@@ -1,0 +1,991 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Consumer GPU P2P &amp; vLLM Guide</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:        #0d1117;
+      --surface:   #161b22;
+      --border:    #30363d;
+      --text:      #e6edf3;
+      --muted:     #8b949e;
+      --green:     #3fb950;
+      --red:       #f85149;
+      --yellow:    #d29922;
+      --blue:      #58a6ff;
+      --purple:    #bc8cff;
+      --accent:    #1f6feb;
+      --radius:    10px;
+    }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+    }
+
+    a { color: var(--blue); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    /* ── NAV ────────────────────────────────────────────────────────────── */
+    nav {
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      background: rgba(13, 17, 23, 0.85);
+      backdrop-filter: blur(12px);
+      border-bottom: 1px solid var(--border);
+      padding: 0 2rem;
+      display: flex;
+      align-items: center;
+      gap: 2rem;
+      height: 56px;
+    }
+
+    .nav-brand {
+      font-weight: 700;
+      font-size: 0.95rem;
+      color: var(--text);
+      white-space: nowrap;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    .nav-brand svg { flex-shrink: 0; }
+
+    .nav-links {
+      display: flex;
+      gap: 1.5rem;
+      list-style: none;
+      font-size: 0.875rem;
+    }
+
+    .nav-links a { color: var(--muted); transition: color 0.15s; }
+    .nav-links a:hover { color: var(--text); text-decoration: none; }
+
+    .nav-cta {
+      margin-left: auto;
+      background: var(--accent);
+      color: #fff !important;
+      padding: 0.35rem 0.9rem;
+      border-radius: 6px;
+      font-size: 0.8rem;
+      font-weight: 600;
+      transition: background 0.15s;
+      text-decoration: none !important;
+    }
+    .nav-cta:hover { background: #388bfd; }
+
+    /* ── HERO ────────────────────────────────────────────────────────────── */
+    .hero {
+      max-width: 860px;
+      margin: 0 auto;
+      padding: 6rem 2rem 4rem;
+      text-align: center;
+    }
+
+    .hero-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      background: rgba(31, 111, 235, 0.15);
+      border: 1px solid rgba(88, 166, 255, 0.25);
+      color: var(--blue);
+      font-size: 0.8rem;
+      font-weight: 600;
+      padding: 0.3rem 0.75rem;
+      border-radius: 999px;
+      margin-bottom: 1.5rem;
+    }
+
+    .hero h1 {
+      font-size: clamp(2rem, 5vw, 3.25rem);
+      font-weight: 800;
+      letter-spacing: -0.03em;
+      line-height: 1.15;
+      margin-bottom: 1.25rem;
+    }
+
+    .hero h1 span { color: var(--blue); }
+
+    .hero p {
+      font-size: 1.1rem;
+      color: var(--muted);
+      max-width: 620px;
+      margin: 0 auto 2.5rem;
+    }
+
+    .hero-actions {
+      display: flex;
+      justify-content: center;
+      gap: 1rem;
+      flex-wrap: wrap;
+    }
+
+    .btn-primary {
+      background: var(--accent);
+      color: #fff;
+      padding: 0.65rem 1.5rem;
+      border-radius: 8px;
+      font-weight: 600;
+      font-size: 0.95rem;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      transition: background 0.15s, transform 0.1s;
+    }
+    .btn-primary:hover { background: #388bfd; text-decoration: none; transform: translateY(-1px); }
+
+    .btn-secondary {
+      background: var(--surface);
+      color: var(--text);
+      border: 1px solid var(--border);
+      padding: 0.65rem 1.5rem;
+      border-radius: 8px;
+      font-weight: 600;
+      font-size: 0.95rem;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      transition: background 0.15s, transform 0.1s;
+    }
+    .btn-secondary:hover { background: #21262d; text-decoration: none; transform: translateY(-1px); }
+
+    /* ── QUICK INSTALL ───────────────────────────────────────────────────── */
+    .quick-install {
+      max-width: 540px;
+      margin: 3.5rem auto;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+    }
+
+    .quick-install-header {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.6rem 1rem;
+      background: #21262d;
+      font-size: 0.75rem;
+      color: var(--muted);
+      border-bottom: 1px solid var(--border);
+    }
+
+    .dot { width: 10px; height: 10px; border-radius: 50%; }
+    .dot-red    { background: #ff5f57; }
+    .dot-yellow { background: #febc2e; }
+    .dot-green  { background: #28c840; }
+
+    .quick-install pre {
+      padding: 1rem 1.25rem;
+      font-size: 0.875rem;
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      color: var(--green);
+      white-space: pre;
+      overflow-x: auto;
+    }
+
+    /* ── SECTION COMMON ──────────────────────────────────────────────────── */
+    section {
+      max-width: 1040px;
+      margin: 0 auto;
+      padding: 3.5rem 2rem;
+    }
+
+    .section-title {
+      font-size: 1.6rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      margin-bottom: 0.4rem;
+    }
+    .section-sub {
+      color: var(--muted);
+      font-size: 0.95rem;
+      margin-bottom: 2.5rem;
+    }
+
+    hr.divider {
+      border: none;
+      border-top: 1px solid var(--border);
+      max-width: 1040px;
+      margin: 0 auto;
+    }
+
+    /* ── STATUS CARDS ────────────────────────────────────────────────────── */
+    .status-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 1rem;
+    }
+
+    .status-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1.25rem 1.5rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.6rem;
+    }
+
+    .status-icon {
+      width: 36px;
+      height: 36px;
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1.1rem;
+    }
+
+    .icon-green  { background: rgba(63, 185, 80, 0.15);  }
+    .icon-red    { background: rgba(248, 81, 73, 0.15);  }
+    .icon-yellow { background: rgba(210, 153, 34, 0.15); }
+
+    .status-card h3 {
+      font-size: 0.875rem;
+      font-weight: 600;
+      color: var(--text);
+    }
+
+    .status-card p {
+      font-size: 0.8rem;
+      color: var(--muted);
+      line-height: 1.5;
+    }
+
+    .tag {
+      display: inline-block;
+      font-size: 0.7rem;
+      font-weight: 700;
+      padding: 0.15rem 0.5rem;
+      border-radius: 4px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+
+    .tag-green  { background: rgba(63, 185, 80, 0.15);  color: var(--green);  }
+    .tag-red    { background: rgba(248, 81, 73, 0.15);  color: var(--red);    }
+    .tag-yellow { background: rgba(210, 153, 34, 0.15); color: var(--yellow); }
+
+    /* ── BENCHMARK TABLE ─────────────────────────────────────────────────── */
+    .bench-tabs {
+      display: flex;
+      gap: 0.5rem;
+      margin-bottom: 1rem;
+      flex-wrap: wrap;
+    }
+
+    .bench-tab {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--muted);
+      padding: 0.35rem 0.85rem;
+      border-radius: 6px;
+      font-size: 0.8rem;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .bench-tab:hover,
+    .bench-tab.active {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+    }
+
+    .bench-panel { display: none; }
+    .bench-panel.active { display: block; }
+
+    .bench-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.875rem;
+    }
+
+    .bench-table th {
+      text-align: left;
+      padding: 0.6rem 0.85rem;
+      color: var(--muted);
+      font-weight: 600;
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .bench-table td {
+      padding: 0.75rem 0.85rem;
+      border-bottom: 1px solid #21262d;
+    }
+
+    .bench-table tr:last-child td { border-bottom: none; }
+
+    .bench-table tr:hover td { background: rgba(255,255,255,0.02); }
+
+    .delta-good  { color: var(--green); font-weight: 600; }
+    .delta-great { color: #2ea043;      font-weight: 700; }
+
+    /* ── FEATURE GRID ────────────────────────────────────────────────────── */
+    .feature-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 1rem;
+    }
+
+    .feature-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1.5rem;
+    }
+
+    .feature-card h3 {
+      font-size: 0.95rem;
+      font-weight: 700;
+      margin-bottom: 0.5rem;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    .feature-card p {
+      font-size: 0.85rem;
+      color: var(--muted);
+      line-height: 1.6;
+    }
+
+    /* ── PCIe TOPOLOGY ───────────────────────────────────────────────────── */
+    .topo-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1.75rem;
+    }
+
+    .topo-card pre {
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      font-size: 0.82rem;
+      color: var(--text);
+      overflow-x: auto;
+      line-height: 1.7;
+    }
+
+    .topo-comment { color: var(--muted); }
+    .topo-good    { color: var(--green); }
+    .topo-warn    { color: var(--yellow); }
+    .topo-path    { color: var(--blue); }
+
+    /* ── ENV VARS ─────────────────────────────────────────────────────────── */
+    .env-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+    }
+
+    .env-card-header {
+      padding: 1rem 1.25rem 0.5rem;
+      font-size: 0.8rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+      border-bottom: 1px solid var(--border);
+    }
+
+    .env-row {
+      display: flex;
+      align-items: flex-start;
+      gap: 1rem;
+      padding: 0.8rem 1.25rem;
+      border-bottom: 1px solid #21262d;
+      font-size: 0.85rem;
+    }
+    .env-row:last-child { border-bottom: none; }
+
+    .env-key {
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      color: var(--purple);
+      white-space: nowrap;
+      min-width: 220px;
+    }
+    .env-val { color: var(--green); font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace; }
+    .env-desc { color: var(--muted); }
+
+    /* ── SCRIPTS TABLE ───────────────────────────────────────────────────── */
+    .scripts-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.875rem;
+    }
+
+    .scripts-table th {
+      text-align: left;
+      padding: 0.6rem 1rem;
+      color: var(--muted);
+      font-size: 0.75rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .scripts-table td {
+      padding: 0.75rem 1rem;
+      border-bottom: 1px solid #21262d;
+    }
+
+    .scripts-table tr:last-child td { border-bottom: none; }
+    .scripts-table tr:hover td { background: rgba(255,255,255,0.02); }
+
+    .scripts-table code {
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      font-size: 0.8rem;
+      background: #21262d;
+      padding: 0.1rem 0.4rem;
+      border-radius: 4px;
+      color: var(--blue);
+    }
+
+    /* ── HW TABLE ────────────────────────────────────────────────────────── */
+    .hw-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.875rem;
+    }
+
+    .hw-table th {
+      text-align: left;
+      padding: 0.6rem 1rem;
+      color: var(--muted);
+      font-size: 0.75rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .hw-table td {
+      padding: 0.7rem 1rem;
+      border-bottom: 1px solid #21262d;
+    }
+    .hw-table tr:last-child td { border-bottom: none; }
+
+    /* ── DOCS GRID ───────────────────────────────────────────────────────── */
+    .docs-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+      gap: 0.85rem;
+    }
+
+    .doc-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1.1rem 1.25rem;
+      display: flex;
+      gap: 0.75rem;
+      align-items: flex-start;
+      transition: border-color 0.15s;
+    }
+    .doc-card:hover { border-color: var(--accent); text-decoration: none; }
+
+    .doc-num {
+      font-size: 0.7rem;
+      font-weight: 700;
+      color: var(--accent);
+      background: rgba(31, 111, 235, 0.12);
+      border-radius: 5px;
+      padding: 0.25rem 0.45rem;
+      white-space: nowrap;
+      margin-top: 1px;
+    }
+
+    .doc-card h3 {
+      font-size: 0.875rem;
+      font-weight: 600;
+      margin-bottom: 0.25rem;
+      color: var(--text);
+    }
+
+    .doc-card p {
+      font-size: 0.775rem;
+      color: var(--muted);
+      line-height: 1.4;
+    }
+
+    /* ── FOOTER ──────────────────────────────────────────────────────────── */
+    footer {
+      border-top: 1px solid var(--border);
+      padding: 2rem;
+      text-align: center;
+      font-size: 0.8rem;
+      color: var(--muted);
+    }
+
+    footer a { color: var(--muted); }
+    footer a:hover { color: var(--text); }
+
+    /* ── RESPONSIVE ──────────────────────────────────────────────────────── */
+    @media (max-width: 680px) {
+      .nav-links { display: none; }
+      .env-row { flex-direction: column; gap: 0.25rem; }
+      .env-key { min-width: unset; }
+    }
+  </style>
+</head>
+<body>
+
+<!-- NAV -->
+<nav>
+  <div class="nav-brand">
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#58a6ff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/>
+    </svg>
+    Consumer GPU P2P Guide
+  </div>
+  <ul class="nav-links">
+    <li><a href="#how-it-works">How it works</a></li>
+    <li><a href="#benchmarks">Benchmarks</a></li>
+    <li><a href="#install">Install</a></li>
+    <li><a href="#docs">Docs</a></li>
+  </ul>
+  <a class="nav-cta" href="https://github.com/groxaxo/consumer-gpu-p2p-vllm-guide">View on GitHub</a>
+</nav>
+
+<!-- HERO -->
+<div class="hero">
+  <div class="hero-badge">
+    <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
+    Intel Consumer GPU · Alder Lake / Raptor Lake
+  </div>
+  <h1>Multi-GPU LLM inference on<br /><span>consumer hardware</span> — it works</h1>
+  <p>
+    A complete guide and automated installer for running vLLM with tensor parallelism
+    across multiple NVIDIA GPUs on Intel desktop platforms — even when PCIe BAR P2P is broken.
+  </p>
+  <div class="hero-actions">
+    <a class="btn-primary" href="#install">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/>
+      </svg>
+      Quick install
+    </a>
+    <a class="btn-secondary" href="https://github.com/groxaxo/consumer-gpu-p2p-vllm-guide">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+        <path d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.531 1.032 1.531 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z"/>
+      </svg>
+      GitHub
+    </a>
+  </div>
+</div>
+
+<!-- QUICK INSTALL -->
+<div id="install" class="quick-install">
+  <div class="quick-install-header">
+    <div class="dot dot-red"></div>
+    <div class="dot dot-yellow"></div>
+    <div class="dot dot-green"></div>
+    <span style="margin-left: 0.5rem;">terminal</span>
+  </div>
+  <pre>git clone https://github.com/groxaxo/consumer-gpu-p2p-vllm-guide.git
+cd consumer-gpu-p2p-vllm-guide
+python3 install.py</pre>
+</div>
+
+<hr class="divider" />
+
+<!-- HOW IT WORKS -->
+<section id="how-it-works">
+  <div class="section-title">What works — and what doesn't</div>
+  <div class="section-sub">
+    Intel consumer platforms can't route BAR-mapped P2P TLPs between root ports.
+    Here's the full picture.
+  </div>
+
+  <div class="status-grid">
+    <div class="status-card">
+      <div class="status-icon icon-red">❌</div>
+      <span class="tag tag-red">Fails</span>
+      <h3>Direct BAR P2P</h3>
+      <p>GPU-to-GPU memory access via PCIe BAR windows. Causes <strong>data corruption (NaN)</strong> on Intel consumer root complexes — a silicon-level limitation.</p>
+    </div>
+    <div class="status-card">
+      <div class="status-icon icon-red">❌</div>
+      <span class="tag tag-red">Fails</span>
+      <h3>CUDA IPC</h3>
+      <p>Cross-process BAR mapping also fails. vLLM's <code>can_actually_p2p()</code> test catches this and automatically disables custom all-reduce.</p>
+    </div>
+    <div class="status-card">
+      <div class="status-icon icon-green">✅</div>
+      <span class="tag tag-green">Works</span>
+      <h3>cudaMemcpyPeer</h3>
+      <p>DMA staging through host RAM delivers <strong>~6 GB/s</strong> throughput. Requires the patched NVIDIA driver to enable the peer DMA path.</p>
+    </div>
+    <div class="status-card">
+      <div class="status-icon icon-green">✅</div>
+      <span class="tag tag-green">Works</span>
+      <h3>NCCL SHM Transport</h3>
+      <p>NCCL probes at startup, detects the P2P failure, and auto-selects shared-host-memory transport. No manual flags needed.</p>
+    </div>
+    <div class="status-card">
+      <div class="status-icon icon-green">✅</div>
+      <span class="tag tag-green">Works</span>
+      <h3>vLLM TP=2</h3>
+      <p>Full tensor parallelism across two consumer GPUs. vLLM detects the P2P failure and delegates all-reduce to NCCL automatically.</p>
+    </div>
+    <div class="status-card">
+      <div class="status-icon icon-green">✅</div>
+      <span class="tag tag-green">Works</span>
+      <h3>Ollama Multi-GPU</h3>
+      <p>Ollama uses the same CUDA DMA path. A systemd drop-in sets <code>CUDA_VISIBLE_DEVICES</code> and <code>OLLAMA_NUM_GPU=2</code>.</p>
+    </div>
+  </div>
+</section>
+
+<hr class="divider" />
+
+<!-- PCIE TOPOLOGY -->
+<section>
+  <div class="section-title">PCIe topology</div>
+  <div class="section-sub">Test rig: Intel i7-12700KF with 5 NVIDIA GPUs across CPU PEG and PCH lanes.</div>
+
+  <div class="topo-card">
+    <pre><span class="topo-comment"># CPU PEG lanes (direct to CPU root complex)</span>
+<span class="topo-path">  00:01.0</span> → [01] <span class="topo-comment">EMPTY SLOT   (x16 electrical)</span>
+<span class="topo-path">  00:01.1</span> → [02] <span class="topo-good">GPU0: RTX 3090   Gen4 x8 · ~6.6 GB/s</span>
+
+<span class="topo-comment"># PCH lanes (cross DMI 3.0 x4 bridge — ~16 GB/s shared)</span>
+<span class="topo-path">  00:1b.4</span> → [04] <span class="topo-good">GPU1: RTX 3090   Gen4 x4 · ~6.6 GB/s</span>
+<span class="topo-path">  00:1c.0</span> → [05] <span class="topo-warn">GPU2: RTX 3060   Gen1 x1 · ~0.8 GB/s  ← bandwidth-starved</span>
+<span class="topo-path">  00:1c.1</span> → [06] <span class="topo-warn">GPU3: RTX 3060   Gen1 x1 · ~0.8 GB/s  ← bandwidth-starved</span>
+<span class="topo-path">  00:1c.4</span> → [08] <span class="topo-good">GPU4: RTX 3090   Gen4 x4 · ~6.6 GB/s</span>
+
+<span class="topo-comment"># Best TP=2 pair for inference: GPU0 + GPU1 (one PEG, one PCH, both Gen4)</span></pre>
+  </div>
+</section>
+
+<hr class="divider" />
+
+<!-- BENCHMARKS -->
+<section id="benchmarks">
+  <div class="section-title">Benchmark results</div>
+  <div class="section-sub">
+    Qwen3.6-35B-A3B-FP8 (MoE) on 2× RTX 3090 via vLLM 0.19.0.
+    Disabling P2P probing gives NCCL permission to optimize the SHM path aggressively.
+  </div>
+
+  <div class="bench-tabs">
+    <button class="bench-tab active" onclick="showBench('short')">Short (64/64)</button>
+    <button class="bench-tab" onclick="showBench('medium')">Medium (512/256)</button>
+    <button class="bench-tab" onclick="showBench('concurrent')">Concurrent ×4</button>
+    <button class="bench-tab" onclick="showBench('long')">Long (1024/512)</button>
+  </div>
+
+  <div style="background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden;">
+    <!-- Short -->
+    <div id="bench-short" class="bench-panel active">
+      <table class="bench-table">
+        <thead><tr><th>Metric</th><th>P2P Auto-detect</th><th>P2P Disabled</th><th>Improvement</th></tr></thead>
+        <tbody>
+          <tr><td>TTFT median</td><td>75.2 ms</td><td>68.8 ms</td><td class="delta-good">−8.5%</td></tr>
+          <tr><td>TPOT median</td><td>47.7 ms</td><td>42.6 ms</td><td class="delta-good">−10.7%</td></tr>
+          <tr><td>Throughput</td><td>197 tok/s</td><td><strong>231 tok/s</strong></td><td class="delta-good">+17%</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <!-- Medium -->
+    <div id="bench-medium" class="bench-panel">
+      <table class="bench-table">
+        <thead><tr><th>Metric</th><th>P2P Auto-detect</th><th>P2P Disabled</th><th>Improvement</th></tr></thead>
+        <tbody>
+          <tr><td>TTFT median</td><td>76.2 ms</td><td>69.5 ms</td><td class="delta-good">−8.8%</td></tr>
+          <tr><td>TPOT median</td><td>46.8 ms</td><td>43.0 ms</td><td class="delta-good">−8.1%</td></tr>
+          <tr><td>Throughput</td><td>203 tok/s</td><td><strong>227 tok/s</strong></td><td class="delta-good">+12%</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <!-- Concurrent -->
+    <div id="bench-concurrent" class="bench-panel">
+      <table class="bench-table">
+        <thead><tr><th>Metric</th><th>P2P Auto-detect</th><th>P2P Disabled</th><th>Improvement</th></tr></thead>
+        <tbody>
+          <tr><td>TTFT median</td><td>194 ms</td><td>136 ms</td><td class="delta-great">−30%</td></tr>
+          <tr><td>TPOT median</td><td>52.8 ms</td><td>45.3 ms</td><td class="delta-good">−14%</td></tr>
+          <tr><td>Throughput</td><td>174 tok/s</td><td><strong>217 tok/s</strong></td><td class="delta-good">+24%</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <!-- Long -->
+    <div id="bench-long" class="bench-panel">
+      <table class="bench-table">
+        <thead><tr><th>Metric</th><th>P2P Auto-detect</th><th>P2P Disabled</th><th>Improvement</th></tr></thead>
+        <tbody>
+          <tr><td>TTFT median</td><td>204 ms</td><td>103 ms</td><td class="delta-great">−50%</td></tr>
+          <tr><td>TPOT median</td><td>58.1 ms</td><td>42.9 ms</td><td class="delta-great">−26%</td></tr>
+          <tr><td>Throughput</td><td>48 tok/s</td><td><strong>115 tok/s</strong></td><td class="delta-great">+142%</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <p style="margin-top: 0.85rem; font-size: 0.8rem; color: var(--muted);">
+    Long-sequence auto-detect showed high TPOT variance (46–105 ms); P2P disabled was rock-stable (42.7–43.2 ms).
+    The variance comes from NCCL's fallback path struggling with larger KV-cache working sets.
+  </p>
+</section>
+
+<hr class="divider" />
+
+<!-- ENV VARS -->
+<section>
+  <div class="section-title">Environment variables</div>
+  <div class="section-sub">Copy-paste config for production use. These two variables are all you need.</div>
+
+  <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 1rem;">
+    <div class="env-card">
+      <div class="env-card-header">Production (fastest)</div>
+      <div class="env-row">
+        <span class="env-key">NCCL_P2P_DISABLE</span>
+        <span class="env-val">=1</span>
+      </div>
+      <div class="env-row">
+        <span class="env-key">VLLM_SKIP_P2P_CHECK</span>
+        <span class="env-val">=1</span>
+      </div>
+      <div class="env-row" style="border-top: 1px solid var(--border);">
+        <span class="env-desc">Skip P2P probe entirely. Saves 5 s on startup. NCCL goes straight to SHM and optimizes aggressively. 10–15% better TPOT.</span>
+      </div>
+    </div>
+
+    <div class="env-card">
+      <div class="env-card-header">Initial validation (first run)</div>
+      <div class="env-row">
+        <span class="env-key">NCCL_P2P_DISABLE</span>
+        <span class="env-val">=0</span>
+      </div>
+      <div class="env-row">
+        <span class="env-key">VLLM_SKIP_P2P_CHECK</span>
+        <span class="env-val">=0</span>
+      </div>
+      <div class="env-row" style="border-top: 1px solid var(--border);">
+        <span class="env-desc">Let NCCL probe and fall back. Let vLLM test IPC and disable custom all-reduce. Confirms the auto-detection pipeline works. Use once, then switch.</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<hr class="divider" />
+
+<!-- INSTALLER FEATURES -->
+<section>
+  <div class="section-title">What the installer does</div>
+  <div class="section-sub">One command handles everything — including staying alive through kernel upgrades.</div>
+
+  <div class="feature-grid">
+    <div class="feature-card">
+      <h3>
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--green)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+        Patched NVIDIA Driver
+      </h3>
+      <p>Clones <code>aikitoria/open-gpu-kernel-modules</code> branch <code>595.58.03-p2p</code> and registers it with DKMS so the patched modules are always available.</p>
+    </div>
+    <div class="feature-card">
+      <h3>
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--green)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+        Kernel Upgrade Safe
+      </h3>
+      <p>DKMS rebuilds the patched modules (MOK-signed, Secure Boot compatible) every time apt installs a new kernel — before you reboot. <code>apt upgrade</code> is safe to run any time.</p>
+    </div>
+    <div class="feature-card">
+      <h3>
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--green)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+        apt Lockdown
+      </h3>
+      <p>An apt pin (<code>Pin-Priority: -1</code>) and <code>apt-mark hold</code> block new <code>nvidia-driver-*</code> and <code>libnccl*</code> packages from replacing the patched driver.</p>
+    </div>
+    <div class="feature-card">
+      <h3>
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--green)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+        GRUB + modprobe
+      </h3>
+      <p>Patches GRUB with <code>intel_iommu=on iommu=pt pci=noaer pcie_aspm=off</code> and writes <code>/etc/modprobe.d/nvidia.conf</code> with <code>RMForceP2PType=0</code>.</p>
+    </div>
+    <div class="feature-card">
+      <h3>
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--green)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+        vLLM Environment
+      </h3>
+      <p>Creates <code>~/venvs/vllm</code> and installs the full CUDA 12.8 vLLM stack via <code>uv</code>. Fast, reproducible, isolated from system Python.</p>
+    </div>
+    <div class="feature-card">
+      <h3>
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--green)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+        Health Check Script
+      </h3>
+      <p>Installs <code>/usr/local/sbin/p2p-healthcheck</code> for post-reboot validation. Run after any kernel update to confirm everything still works.</p>
+    </div>
+  </div>
+</section>
+
+<hr class="divider" />
+
+<!-- SCRIPTS -->
+<section>
+  <div class="section-title">Scripts</div>
+  <div class="section-sub">Production-ready utilities for launching, validating, and benchmarking.</div>
+
+  <div style="background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden;">
+    <table class="scripts-table">
+      <thead><tr><th>Script</th><th>Purpose</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>install.py</code></td>
+          <td>Interactive autoinstaller — full-screen animated UI, handles everything end-to-end</td>
+        </tr>
+        <tr>
+          <td><code>scripts/manage_vllm_safe_tp2.sh</code></td>
+          <td>Production vLLM launcher with boot arg gates; supports <code>start / stop / restart / status / health</code></td>
+        </tr>
+        <tr>
+          <td><code>scripts/require-gpu-pair.sh</code></td>
+          <td>Pre-flight check that validates the TP=2 GPU pair before launching</td>
+        </tr>
+        <tr>
+          <td><code>scripts/post-reboot-test.sh</code></td>
+          <td>Full post-reboot validation: boot args, NCCL all-reduce, P2P paths</td>
+        </tr>
+        <tr>
+          <td><code>scripts/test_nccl_tp2.py</code></td>
+          <td>Standalone NCCL all-reduce test across two GPUs using SHM transport</td>
+        </tr>
+        <tr>
+          <td><code>scripts/p2p_bandwidth_bench.py</code></td>
+          <td>Full P2P + PCIe bandwidth benchmark — compiles CUDA source, runs all pairs, emits reproducible system report</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<hr class="divider" />
+
+<!-- HARDWARE -->
+<section>
+  <div class="section-title">Tested hardware</div>
+  <div class="section-sub">Validated on this configuration. Should work on any Alder Lake / Raptor Lake desktop.</div>
+
+  <div style="background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden;">
+    <table class="hw-table">
+      <thead><tr><th>Component</th><th>Details</th></tr></thead>
+      <tbody>
+        <tr><td>CPU</td><td>Intel Core i7-12700KF (Alder Lake, 12th gen)</td></tr>
+        <tr><td>GPUs</td><td>2× RTX 3090 (24 GiB) + 2× RTX 3060 (12 GiB) + 1× RTX 3090 (24 GiB)</td></tr>
+        <tr><td>PCIe topology</td><td>All 5 GPUs on separate root ports, no PLX switch</td></tr>
+        <tr><td>OS</td><td>Ubuntu 22.04, kernel 6.x</td></tr>
+        <tr><td>Driver</td><td>NVIDIA 595.58.03 (aikitoria/open-gpu-kernel-modules <code>595.58.03-p2p</code>)</td></tr>
+        <tr><td>Test models</td><td>Qwen/Qwen3.6-35B-A3B-FP8 (MoE), Qwen/Qwen3.5-9B</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p style="margin-top: 1rem; font-size: 0.85rem; color: var(--muted);">
+    True BAR P2P would require AMD Threadripper / EPYC, Intel Xeon, a PLX/PEX PCIe switch, or an NVLink bridge.
+    On Intel consumer platforms the SHM path is your best option — and with P2P probing disabled, it's surprisingly fast.
+  </p>
+</section>
+
+<hr class="divider" />
+
+<!-- DOCS -->
+<section id="docs">
+  <div class="section-title">Documentation</div>
+  <div class="section-sub">Eight detailed guides covering every part of the setup.</div>
+
+  <div class="docs-grid">
+    <a class="doc-card" href="docs/01-boot-config.md">
+      <div class="doc-num">01</div>
+      <div>
+        <h3>Boot Configuration</h3>
+        <p>GRUB kernel args, IOMMU setup, modprobe config</p>
+      </div>
+    </a>
+    <a class="doc-card" href="docs/02-patched-driver.md">
+      <div class="doc-num">02</div>
+      <div>
+        <h3>Patched NVIDIA Driver</h3>
+        <p>Why patching is needed, build steps, driver pinning</p>
+      </div>
+    </a>
+    <a class="doc-card" href="docs/03-p2p-diagnostics.md">
+      <div class="doc-num">03</div>
+      <div>
+        <h3>P2P Diagnostics</h3>
+        <p>Testing P2P capability and interpreting results</p>
+      </div>
+    </a>
+    <a class="doc-card" href="docs/04-vllm-setup.md">
+      <div class="doc-num">04</div>
+      <div>
+        <h3>vLLM Setup</h3>
+        <p>Installation via uv, environment variables, validation</p>
+      </div>
+    </a>
+    <a class="doc-card" href="docs/05-launcher.md">
+      <div class="doc-num">05</div>
+      <div>
+        <h3>Production Launcher</h3>
+        <p>Full docs for the canonical <code>manage_vllm_safe_tp2.sh</code> script</p>
+      </div>
+    </a>
+    <a class="doc-card" href="docs/06-ollama.md">
+      <div class="doc-num">06</div>
+      <div>
+        <h3>Ollama Multi-GPU</h3>
+        <p>systemd drop-in, GPU selection, vLLM coexistence</p>
+      </div>
+    </a>
+    <a class="doc-card" href="docs/07-troubleshooting.md">
+      <div class="doc-num">07</div>
+      <div>
+        <h3>Troubleshooting</h3>
+        <p>Common issues, recovery steps, debugging tips</p>
+      </div>
+    </a>
+    <a class="doc-card" href="docs/08-lockdown.md">
+      <div class="doc-num">08</div>
+      <div>
+        <h3>apt Lockdown</h3>
+        <p>Surviving <code>apt upgrade</code> — DKMS, apt pins, recovery</p>
+      </div>
+    </a>
+  </div>
+</section>
+
+<!-- FOOTER -->
+<footer>
+  <p>
+    Released under the <a href="LICENSE">MIT License</a> ·
+    Patched driver: <a href="https://github.com/aikitoria/open-gpu-kernel-modules">aikitoria/open-gpu-kernel-modules</a> (Dual MIT/GPL)
+  </p>
+</footer>
+
+<script>
+  function showBench(id) {
+    document.querySelectorAll('.bench-panel').forEach(p => p.classList.remove('active'));
+    document.querySelectorAll('.bench-tab').forEach(t => t.classList.remove('active'));
+    document.getElementById('bench-' + id).classList.add('active');
+    event.currentTarget.classList.add('active');
+  }
+</script>
+</body>
+</html>
