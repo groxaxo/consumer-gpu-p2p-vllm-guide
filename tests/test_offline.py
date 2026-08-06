@@ -76,13 +76,16 @@ class DoctorTests(unittest.TestCase):
             doctor.normalize_devices("0")
         with self.assertRaises(ValueError):
             doctor.normalize_devices("0,0")
+        with self.assertRaises(ValueError):
+            doctor.normalize_devices("GPU-a,GPU-b")
+        self.assertEqual(doctor.normalize_devices("00, 02"), "0,2")
 
     def test_profile_round_trip(self) -> None:
         values = {
             "P2P_PROFILE_VERSION": "2",
             "P2P_PROFILE_STATUS": "validated",
             "P2P_PROFILE_DEVICES": "2,0",
-            "P2P_PROFILE_KERNEL": "kernel with spaces",
+            "P2P_PROFILE_KERNEL": "kernel-no-spaces",
             "NCCL_P2P_DISABLE": "0",
         }
         with tempfile.TemporaryDirectory() as temporary:
@@ -99,6 +102,34 @@ class DoctorTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 doctor.parse_profile(path)
 
+    def test_parse_profile_rejects_unknown_and_duplicate_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = pathlib.Path(temporary) / "profile.env"
+            path.write_text("export LD_PRELOAD=/tmp/evil.so\n", encoding="utf-8")
+            with self.assertRaises(RuntimeError):
+                doctor.parse_profile(path)
+            path.write_text(
+                "export NCCL_P2P_DISABLE=0\nexport NCCL_P2P_DISABLE=0\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(RuntimeError):
+                doctor.parse_profile(path)
+            path.write_text(
+                "export P2P_PROFILE_CREATED_UTC=$(id)\n", encoding="utf-8"
+            )
+            with self.assertRaises(RuntimeError):
+                doctor.parse_profile(path)
+
+    def test_profile_security_requires_mode_0600(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = pathlib.Path(temporary) / "profile.env"
+            path.write_text("export NCCL_P2P_DISABLE=0\n", encoding="utf-8")
+            path.chmod(0o644)
+            with self.assertRaises(RuntimeError):
+                doctor.validate_profile_file_security(path)
+            path.chmod(0o600)
+            doctor.validate_profile_file_security(path)
+
     def test_profile_values_keep_real_vllm_check_enabled(self) -> None:
         values = doctor.profile_values(
             devices="0,1",
@@ -111,6 +142,13 @@ class DoctorTests(unittest.TestCase):
         )
         self.assertEqual(values["NCCL_P2P_DISABLE"], "0")
         self.assertEqual(values["VLLM_SKIP_P2P_CHECK"], "0")
+        with self.assertRaises(ValueError):
+            doctor.profile_values(
+                devices="0,1",
+                inventory=[{"uuid": "GPU-a"}, {"uuid": "GPU-b"}],
+                fingerprint="abc",
+                transport="fallback-observed",
+            )
 
 
 if __name__ == "__main__":
