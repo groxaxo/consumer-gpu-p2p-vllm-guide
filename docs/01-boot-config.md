@@ -1,31 +1,30 @@
-# 1. Prerequisites & Boot Configuration
+# 1. Boot configuration
 
-## Why Boot Args Matter
+The upstream P2P patch requires IOMMU passthrough. The required CPU-specific
+switch is:
 
-The patched NVIDIA driver (`RMForceP2PType=0`) and CUDA P2P APIs require IOMMU
-to be configured correctly. On Intel consumer platforms:
+- Intel: `intel_iommu=on iommu=pt`
+- AMD: `amd_iommu=on iommu=pt`
 
-- `intel_iommu=on` enables the Intel IOMMU (VT-d), which the patched driver
-  needs for DMA remapping of peer transactions.
-- `iommu=pt` enables pass-through mode — devices use 1:1 DMA translations,
-  avoiding performance overhead while keeping IOMMU enabled for the driver.
-- `pci=noaer` disables PCIe Advanced Error Reporting printks (reduces log
-  noise from the many PCIe errors this topology generates).
-- `pcie_aspm=off` disables PCIe Active State Power Management — prevents
-  link power-state transitions that can cause instability with many GPUs.
+`iommu=pt` creates identity mappings for ordinary DMA devices. This is useful
+for the peer BAR1 path, but it reduces DMA isolation. Do not use this setup on a
+host that runs untrusted devices or workloads.
 
 ## Configure GRUB
 
-Edit `/etc/default/grub`:
+Edit `/etc/default/grub` and append only the two required arguments to the
+existing `GRUB_CMDLINE_LINUX_DEFAULT` value.
 
-```bash
-sudo nano /etc/default/grub
+Intel example:
+
+```text
+GRUB_CMDLINE_LINUX_DEFAULT="quiet splash intel_iommu=on iommu=pt"
 ```
 
-Change the `GRUB_CMDLINE_LINUX_DEFAULT` line:
+AMD example:
 
-```
-GRUB_CMDLINE_LINUX_DEFAULT="quiet splash intel_iommu=on iommu=pt pci=noaer pcie_aspm=off"
+```text
+GRUB_CMDLINE_LINUX_DEFAULT="quiet splash amd_iommu=on iommu=pt"
 ```
 
 Apply and reboot:
@@ -35,42 +34,66 @@ sudo update-grub
 sudo reboot
 ```
 
-## Verify After Reboot
+The installer performs the same merge without discarding existing kernel
+arguments:
+
+```bash
+python3 install.py --yes
+```
+
+## Arguments the guide no longer adds
+
+The old revision added `pci=noaer` and `pcie_aspm=off` unconditionally. They are
+not requirements of the upstream patch:
+
+- `pci=noaer` hides Advanced Error Reporting. It can conceal the evidence needed
+  to diagnose a bad riser, link, or peer transaction.
+- `pcie_aspm=off` changes power management system-wide. Use it only after a
+  reproducible link-state diagnosis, not as a P2P prerequisite.
+
+## `RMForceP2PType`
+
+Normal operation needs no registry override. The patched driver automatically
+uses NVLink for a supported RTX 3090 pair when present and PCIe BAR1 otherwise.
+
+`RMForceP2PType=1` is an upstream test mode that forces PCIe instead of NVLink.
+Enable it only deliberately:
+
+```bash
+python3 install.py --force-pcie --yes
+sudo reboot
+```
+
+The installer removes the old guide-managed `RMForceP2PType=0` file because
+zero is already the driver default and the override adds no value.
+
+## Verify after reboot
 
 ```bash
 cat /proc/cmdline
-# Should contain: intel_iommu=on iommu=pt
-
-cat /proc/driver/nvidia/params | grep RegistryDwords
-# Should show: RMForceP2PType: 0
+find /sys/kernel/iommu_groups -mindepth 1 -maxdepth 1 -type d | wc -l
+dmesg | grep -Ei 'DMAR|IOMMU' | head -30
 ```
 
-## Driver Registry Key
+Expected:
 
-Create `/etc/modprobe.d/nvidia.conf`:
+1. The correct CPU-specific IOMMU switch is present.
+2. `iommu=pt` is present.
+3. `/sys/kernel/iommu_groups` is populated.
 
-```
-# RMForceP2PType=0 lets the driver auto-detect P2P capability.
-# Setting to 1 forces PCIe P2P and can cause data corruption on Intel platforms
-# where BAR-mapped P2P doesn't actually work.
-options nvidia NVreg_RegistryDwords="RMForceP2PType=0"
-```
+Do not infer P2P success from those checks. Continue through the direct peer and
+CUDA IPC tests in [03 — P2P diagnostics](03-p2p-diagnostics.md).
 
-Rebuild initramfs:
+## Firmware checklist
 
-```bash
-sudo update-initramfs -u
-```
+Names differ by motherboard, but check:
 
-## Verify IOMMU
+- VT-d / AMD-Vi: enabled
+- Above 4G Decoding: enabled
+- Resizable BAR: test both firmware-supported states if peer mapping fails
+- PCIe slot bifurcation: matches the physical card/riser layout
+- ACS control: prefer firmware control; ACS can redirect peer traffic upstream
+- PCIe generation: force Gen3 temporarily when diagnosing marginal Gen4 risers
 
-```bash
-dmesg | grep -i iommu | head -5
-# Should show: DMAR: IOMMU enabled, Intel-IOMMU enabled
-```
-
-## Next Step
-
-Once GRUB and modprobe are configured and you've rebooted, continue to
-[doc 02 — Patched NVIDIA Driver](02-patched-driver.md) to install the driver,
-or run `python3 install.py` to have the installer handle everything from here.
+A topology label such as `PHB` is not a correctness verdict. The validator's
+exact peer load/store and CUDA IPC tests are the acceptance criteria.

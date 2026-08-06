@@ -1,380 +1,382 @@
-# Consumer GPU P2P & vLLM Tensor-Parallel Guide
+# Consumer NVIDIA P2P for vLLM — validated Ampere setup
 
-Running vLLM with tensor parallelism (TP=2) across consumer NVIDIA GPUs on an
-Intel desktop platform. This guide documents the full journey: patched drivers,
-P2P expectations vs reality, what actually works, and production-ready scripts.
+This repository installs and validates the patched NVIDIA open kernel modules
+required to expose peer access on supported consumer GPUs, then prevents vLLM
+from using that access until the data path has passed destructive integrity
+tests.
 
-## TL;DR
+The primary target is **RTX 3090 / Ampere on Linux**, including two- and
+three-GPU workstations. The upstream patch also documents RTX 4090 and RTX 5090,
+but this guide's strict default profile requires compute capability 8.x.
 
-**It works — but not how you'd expect.**
+> [!CAUTION]
+> This changes kernel modules and requires `iommu=pt`. IOMMU passthrough reduces
+> DMA isolation and is unsafe for hosts that run untrusted devices or software.
+> Keep a working kernel entry and remote recovery path before changing a
+> production machine.
 
-On Intel consumer platforms (Alder Lake, Raptor Lake, etc.), the CPU root
-complex **cannot** route BAR-mapped PCIe peer-to-peer (P2P) TLPs between
-different root ports. This means:
+## What was wrong with the previous guide
 
-- Direct GPU-to-GPU memory access via PCIe BAR windows: **FAILS** (data corruption)
-- `cudaMemcpyPeer` (DMA staging through host RAM): **WORKS** at ~6 GB/s
-- NCCL all-reduce via SHM (shared host memory): **WORKS** (auto-detected)
-- vLLM TP=2 inference: **WORKS** (auto-disables custom all-reduce, uses NCCL)
+The original version could report a successful installation while leaving P2P
+unavailable or unsafe:
 
-You do **not** need working BAR P2P for multi-GPU inference. NCCL and vLLM
-figure it out automatically. The patched driver is still required for the CUDA
-`cudaDeviceCanAccessPeer`/`cudaMemcpyPeer` path to function.
+1. It built **595.58.03 patched kernel modules without installing or requiring
+   the matching 595.58.03 NVIDIA userspace driver**. That creates a
+   driver/library mismatch or leaves the stock module active.
+2. Its production launcher exported `NCCL_P2P_DISABLE=1`, so NCCL P2P was
+   disabled even though the guide claimed to enable it.
+3. It exported `VLLM_SKIP_P2P_CHECK=1`. In vLLM this means **trust the driver's
+   capability report**; it does not mean “use a cached validated result.” That
+   is the unsafe choice for a patched consumer driver.
+4. It treated `cudaDeviceCanAccessPeer()` and `cudaMemcpyPeer()` as proof of
+   direct peer access. Neither proves that a GPU can correctly load from and
+   store to another GPU's mapped memory.
+5. It declared PCIe P2P impossible on all Intel consumer root complexes. The
+   upstream patch explicitly supports RTX 3090 PCIe BAR1 P2P; actual success is
+   topology-, firmware-, ACS-, and motherboard-dependent and must be measured.
+6. It deleted vLLM's P2P cache on every launch and then skipped the test that
+   recreates it.
 
-## Hardware
+This revision replaces those assumptions with fail-closed validation.
 
-| Component | Details |
-|---|---|
-| CPU | Intel Core i7-12700KF (Alder Lake, 12th gen) |
-| GPUs | 2x RTX 3090 (24 GiB) + 2x RTX 3060 (12 GiB) + 1x RTX 3090 (24 GiB) |
-| PCIe topology | All 5 GPUs on separate root ports, no PLX switch |
-| OS | Ubuntu 22.04, kernel 6.x |
-| Driver | NVIDIA 595.58.03 (aikitoria/open-gpu-kernel-modules `595.58.03-p2p` branch) |
+## The acceptance gates
 
-### PCIe Topology
+A launcher profile is written only when all required gates pass:
 
-```
-CPU PEG lanes (direct to CPU):
-  00:01.0 → [01] EMPTY SLOT (x16 electrical)
-  00:01.1 → [02] GPU0: RTX 3090  (x16 electrical, x8 negotiated)
+| Gate | What is verified | Why it matters |
+|---|---|---|
+| Exact driver stack | `modinfo`, the loaded NVRM module, and `nvidia-smi` all report `595.58.03` | Open kernel modules do not include NVIDIA userspace libraries; both layers must match exactly. |
+| Boot configuration | CPU-specific IOMMU enablement, `iommu=pt`, and active IOMMU groups | The upstream BAR1 path requires passthrough mappings. |
+| Ampere identity | Every selected visible device reports compute capability 8.x | Prevents accidentally applying the Ampere profile to another GPU set. |
+| Direct kernel integrity | Kernels on each GPU read and write exact `uint64_t` patterns in every peer GPU's memory | Catches silent corruption that capability queries and copy APIs miss. |
+| vLLM CUDA IPC integrity | vLLM's own two-process `can_actually_p2p()` mechanism opens, mutates, and verifies peer memory in every direction | This is the path vLLM custom all-reduce depends on. |
+| NCCL correctness | Multi-size all-reduce runs with `NCCL_P2P_DISABLE=0`, produces finite exact values, and records the reported transport when available | Confirms the distributed runtime is correct with P2P enabled. |
 
-PCH lanes (cross DMI bridge):
-  00:1b.4 → [04] GPU1: RTX 3090  (x4)
-  00:1c.0 → [05] GPU2: RTX 3060  (x1)
-  00:1c.1 → [06] GPU3: RTX 3060  (x1)
-  00:1c.4 → [08] GPU4: RTX 3090  (x4)
-```
+The resulting profile is bound to the selected device order, GPU UUIDs, PCI bus
+IDs, driver version, and running kernel. A kernel, driver, GPU-order, slot, or
+boot-argument change makes the profile stale and blocks launch until it is
+regenerated.
 
-## Table of Contents
+## Supported stack
 
-1. [Prerequisites & Boot Configuration](docs/01-boot-config.md)
-2. [Patched NVIDIA Driver](docs/02-patched-driver.md)
-3. [P2P Transport Diagnostics](docs/03-p2p-diagnostics.md)
-4. [vLLM Setup & Configuration](docs/04-vllm-setup.md)
-5. [Production Launcher Script](docs/05-launcher.md)
-6. [Ollama Multi-GPU](docs/06-ollama.md)
-7. [Troubleshooting](docs/07-troubleshooting.md)
-8. [Lockdown: Surviving `apt upgrade`](docs/08-lockdown.md)
+The patch currently pinned by this guide is:
 
-## Quick Start
+- NVIDIA userspace driver: **595.58.03**
+- Patched open kernel modules:
+  [`aikitoria/open-gpu-kernel-modules`, branch `595.58.03-p2p`](https://github.com/aikitoria/open-gpu-kernel-modules/tree/595.58.03-p2p)
+- Reviewed upstream revision:
+  `6dd6ba34a4abfb3761797b26102094b856b01edd`
+- Default Python runtime: PyTorch `2.11.0+cu128`, vLLM `0.21.0`
+- Primary OS path: Ubuntu 22.04/24.04-class systems using GRUB and DKMS
+
+Do not combine this kernel patch with a different NVIDIA userspace version.
+When upstream publishes a patch for another driver, review and update all three
+pins together: userspace version, source revision, and validation evidence.
+
+## Fast path
+
+### 1. Prepare the exact NVIDIA runfile
+
+Download the official **NVIDIA Linux x86_64 595.58.03** runfile from NVIDIA.
+The upstream patch README links the matching driver details page. This
+repository deliberately does not mirror the proprietary runfile or guess its
+URL/checksum.
+
+If `nvidia-smi` already reports exactly `595.58.03`, the runfile argument can be
+omitted. Otherwise:
 
 ```bash
 git clone https://github.com/groxaxo/consumer-gpu-p2p-vllm-guide.git
 cd consumer-gpu-p2p-vllm-guide
-python3 install.py
+
+python3 install.py \
+  --driver-runfile "$HOME/Downloads/NVIDIA-Linux-x86_64-595.58.03.run" \
+  --install-userspace \
+  --lock-driver \
+  --yes
 ```
 
-That is the only command you need. The installer will:
+The installer uses the runfile only for matching userspace libraries
+(`--no-kernel-modules`). It then builds the reviewed patched open modules via
+DKMS. It does **not** pin NCCL.
 
-1. Bootstrap `asciimatics` automatically if it is not installed
-2. Show you a plan of what will change and ask for confirmation
-3. Launch a full-screen animated display while the installation runs in the background
-4. Install OS prerequisites (`apt`)
-5. Clone the patched NVIDIA P2P driver source
-6. **Register the driver with DKMS** so kernel upgrades auto-rebuild it
-7. Patch GRUB boot args and write `/etc/modprobe.d/nvidia.conf`
-8. Lock down apt (`apt-mark hold` + `/etc/apt/preferences.d/00-nvidia-p2p-pin`) so userspace `nvidia-*` / `libnccl*` packages can't replace the `.run`-installed driver
-9. Stash the `.run` installer at `/opt/nvidia-p2p/` and install `/usr/local/sbin/p2p-healthcheck`
-10. Create `~/venvs/vllm` and install a CUDA 12.8 vLLM stack via `uv`
-11. Print the full install log on completion (or on error)
-
-Re-running the installer is cheap: the driver checkout's git revision is
-stamped after every successful DKMS build, and the 5–10 minute rebuild is
-skipped when the revision is unchanged and the modules are already installed
-for the running kernel.
-
-### Surviving `apt upgrade`
-
-Out-of-tree NVIDIA drivers normally die the next time you run
-`sudo apt upgrade`, because a new kernel lands without matching modules. This
-installer fixes that by:
-
-- **DKMS** rebuilds the patched 595.58.03 modules (signed with your MOK key,
-  Secure Boot–compatible) every time apt installs a new kernel — *before* you
-  reboot.
-- An **apt preferences pin** with `Pin-Priority: -1` blocks any new
-  `nvidia-driver-*` / `libnvidia-compute-*` / `linux-modules-nvidia-*` package
-  from landing as a transitive dependency.
-- **apt-mark hold** freezes the currently-installed userspace `nvidia-*` /
-  `libnccl*` packages so a new CUDA-13 NCCL or stock NVIDIA driver can't
-  replace them.
-
-Result: `sudo apt update && sudo apt upgrade` is safe to run any time. Verify
-with `sudo p2p-healthcheck`. See [docs/08-lockdown.md](docs/08-lockdown.md) for
-full details and the recovery procedure.
-
-**Flags:**
-
-| Flag | Effect |
-|---|---|
-| `--dry-run` | Show what would happen — make no changes |
-| `--yes` | Skip the confirmation prompt |
-| `--skip-driver` | Skip driver clone + DKMS build |
-| `--skip-grub` | Skip GRUB / modprobe changes |
-| `--skip-vllm` | Skip venv + vLLM install |
-| `--skip-lockdown` | Skip apt holds, apt pin, healthcheck, `.run` stash |
-| `--driver-dir PATH` | Override driver checkout location |
-| `--venv-dir PATH` | Override venv location |
-
-After install, **reboot** and validate:
+When the exact userspace driver is already installed:
 
 ```bash
-bash scripts/post-reboot-test.sh
+python3 install.py --lock-driver --yes
 ```
 
-Then launch vLLM:
+Review without changing the host:
 
 ```bash
-bash scripts/manage_vllm_safe_tp2.sh start
+python3 install.py --dry-run --yes
 ```
 
-The launcher defaults to the production transport config measured in the
-benchmarks below (`NCCL_P2P_DISABLE=1`, `VLLM_SKIP_P2P_CHECK=1`) and to
-`Qwen/Qwen3.5-9B`. For a one-time validation of the auto-detect path, export
-`NCCL_P2P_DISABLE=0 VLLM_SKIP_P2P_CHECK=0` before starting. See
-[docs/05-launcher.md](docs/05-launcher.md) for all overrides.
+### 2. Reboot
 
-### Launch with TP=2 manually
+```bash
+sudo reboot
+```
+
+A reboot is mandatory. Do not validate against the old in-memory kernel module.
+
+### 3. Validate the exact GPU set
+
+For two RTX 3090s:
+
+```bash
+cd ~/consumer-gpu-p2p-vllm-guide
+CUDA_VISIBLE_DEVICES=0,1 bash scripts/post-reboot-test.sh
+```
+
+For all three RTX 3090s:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2 bash scripts/post-reboot-test.sh
+```
+
+Strict validation requires `nvcc` so it can compile the direct peer load/store
+probe. When a CUDA toolkit is genuinely unavailable, the vLLM CUDA IPC test is
+still mandatory and the kernel test can be made advisory:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 \
-  NCCL_IB_DISABLE=1 \
-  NCCL_P2P_DISABLE=1 \
-  NCCL_SHM_DISABLE=0 \
-  VLLM_SKIP_P2P_CHECK=1 \
-  vllm serve Qwen/Qwen3.6-35B-A3B-FP8 \
-    --tensor-parallel-size 2 \
-    --gpu-memory-utilization 0.92 \
-    --enforce-eager \
-    --max-model-len 32768
+  bash scripts/post-reboot-test.sh --allow-missing-nvcc
 ```
 
-> **Manual steps** (what the installer does under the hood) are documented in
-> [`docs/`](docs/) for reference.
+That weaker profile is suitable only when you understand the reduced evidence.
 
-## What to Set (and Why)
+A successful run ends with:
 
-### For production (recommended — fastest):
+```text
+RESULT=PASS
+Wrote validated profile: ~/.config/vllm/consumer-p2p.env
+```
+
+No profile is written on a failed required gate.
+
+### 4. Launch vLLM with validated P2P
 
 ```bash
-NCCL_P2P_DISABLE=1        # Skip P2P probe — 10-15% faster TPOT
-VLLM_SKIP_P2P_CHECK=1     # Skip vLLM P2P cache generation — saves 5s startup
+CUDA_VISIBLE_DEVICES=0,1 \
+  bash scripts/manage_vllm_safe_tp2.sh start <model-id>
 ```
 
-`manage_vllm_safe_tp2.sh` sets both by default.
-
-Benchmarks show explicitly disabling P2P gives 10–15% better throughput because
-NCCL optimizes the SHM transport path when it knows P2P isn't available.
-
-### For initial validation (first-time setup):
+Despite its backward-compatible filename, the launcher derives TP size from the
+visible GPU count. For three GPUs:
 
 ```bash
-NCCL_P2P_DISABLE=0        # Let NCCL probe — confirms fallback works
-VLLM_SKIP_P2P_CHECK=0     # Let vLLM test P2P — confirms auto-detection
+CUDA_VISIBLE_DEVICES=0,1,2 \
+  bash scripts/manage_vllm_safe_tp2.sh start <model-id>
 ```
 
-Use this once to verify everything works, then switch to the production config.
-
-### Do not use:
+The validated runtime exports:
 
 ```bash
-# ❌ WRONG — vLLM disables custom all-reduce automatically when needed
---disable-custom-all-reduce
+NCCL_P2P_DISABLE=0
+NCCL_SHM_DISABLE=0
+VLLM_SKIP_P2P_CHECK=0
 ```
 
-## Benchmarks
+`VLLM_SKIP_P2P_CHECK=0` is intentional. vLLM performs the real IPC test once
+and stores its directed device-pair results under `~/.cache/vllm/`; later
+starts reuse the cache. The launcher no longer deletes it.
 
-Tested with `Qwen/Qwen3.6-35B-A3B-FP8` (MoE, FP8) on 2x RTX 3090 via vLLM 0.19.0.
-The installer ships vLLM 0.21.0; results are equivalent or better on 0.21.0.
-Two configurations compared:
+## RTX 3090 topology: NVLink, PCIe, TP=2, and TP=3
 
-- **P2P Auto-detect**: `NCCL_P2P_DISABLE=0` — NCCL probes P2P, fails, falls back to SHM
-- **P2P Disabled**: `NCCL_P2P_DISABLE=1` — NCCL skips P2P probe, uses SHM directly
+The upstream patch chooses NVLink for an RTX 3090 pair when NVLink is present
+and falls back to PCIe BAR1 otherwise. No `RMForceP2PType` parameter is required
+for normal operation.
 
-### Short Prompts (64 in / 64 out, sequential)
+To intentionally force PCIe instead of NVLink for testing:
 
-| Metric | P2P Auto-detect | P2P Disabled | Delta |
-|---|---:|---:|---:|
-| TTFT (median) | 75.2 ms | 68.8 ms | **-8.5%** |
-| TPOT (median) | 47.7 ms | 42.6 ms | **-10.7%** |
-| Throughput | 197 tok/s | 231 tok/s | **+17%** |
+```bash
+python3 install.py --force-pcie --yes
+sudo reboot
+```
 
-### Medium Prompts (512 in / 256 out, sequential)
+That writes `RMForceP2PType=1`, matching the upstream test mode. Do not use the
+flag merely because the GPUs are PCIe-only; auto-selection already uses PCIe
+when no NVLink path exists.
 
-| Metric | P2P Auto-detect | P2P Disabled | Delta |
-|---|---:|---:|---:|
-| TTFT (median) | 76.2 ms | 69.5 ms | **-8.8%** |
-| TPOT (median) | 46.8 ms | 43.0 ms | **-8.1%** |
-| Throughput | 203 tok/s | 227 tok/s | **+12%** |
+For vLLM:
 
-### Concurrent (256 in / 128 out, 4 concurrent)
+- **TP=2** can use vLLM's custom all-reduce after the CUDA IPC gate passes.
+- **TP=3** can use NCCL P2P, but vLLM's custom all-reduce does not support world
+  size 3. The launcher reports this distinction instead of calling TP=3 broken.
+- A three-GPU machine can validate all three devices and still run a selected
+  two-GPU pair by generating a separate profile for that exact
+  `CUDA_VISIBLE_DEVICES` order.
 
-| Metric | P2P Auto-detect | P2P Disabled | Delta |
-|---|---:|---:|---:|
-| TTFT (median) | 194 ms | 136 ms | **-30%** |
-| TPOT (median) | 52.8 ms | 45.3 ms | **-14%** |
-| Throughput | 174 tok/s | 217 tok/s | **+24%** |
+Example profiles are intentionally separate:
 
-### Long Sequences (1024 in / 512 out, sequential)
+```bash
+# Pair profile
+CUDA_VISIBLE_DEVICES=0,1 \
+P2P_PROFILE_PATH=~/.config/vllm/p2p-0-1.env \
+  bash scripts/post-reboot-test.sh
 
-| Metric | P2P Auto-detect | P2P Disabled | Delta |
-|---|---:|---:|---:|
-| TTFT (median) | 204 ms | 103 ms | **-50%** |
-| TPOT (median) | 58.1 ms | 42.9 ms | **-26%** |
-| Throughput | 48 tok/s | 115 tok/s | **+142%** |
+# Three-GPU profile
+CUDA_VISIBLE_DEVICES=0,1,2 \
+P2P_PROFILE_PATH=~/.config/vllm/p2p-0-1-2.env \
+  bash scripts/post-reboot-test.sh
+```
 
-> **Note**: The long-sequence P2P auto-detect test showed high variance (TPOT
-> 46–105 ms) while P2P disabled was rock-stable (42.7–43.2 ms). The variance
-> likely comes from NCCL's fallback path struggling with larger KV-cache
-> working sets.
+Use the same `P2P_PROFILE_PATH` when launching.
 
-### Startup Time
+## Launcher modes
 
-| Config | Cold start to ready |
+### `validated` — default
+
+Requires a current machine-bound profile and refuses startup when it is missing
+or stale:
+
+```bash
+VLLM_P2P_MODE=validated bash scripts/manage_vllm_safe_tp2.sh start <model>
+```
+
+### `auto` — diagnostics
+
+Enables NCCL P2P and leaves vLLM's real checker enabled, but does not require a
+saved profile:
+
+```bash
+VLLM_P2P_MODE=auto bash scripts/manage_vllm_safe_tp2.sh start <model>
+```
+
+Use this while diagnosing, not as the normal production path.
+
+### `shm` — explicit recovery mode
+
+Disables NCCL P2P and vLLM custom all-reduce:
+
+```bash
+VLLM_P2P_MODE=shm bash scripts/manage_vllm_safe_tp2.sh start <model>
+```
+
+This is a correct fallback when a motherboard cannot route peer traffic, but it
+is **not P2P**. Keep it only after an A/B benchmark proves it is the best path
+for that host.
+
+## Diagnostics
+
+### Full validator
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 \
+  ~/venvs/vllm/bin/python scripts/p2p_doctor.py validate \
+    --venv ~/venvs/vllm \
+    --write-profile
+```
+
+### Check an existing profile
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 \
+  ~/venvs/vllm/bin/python scripts/p2p_doctor.py check-profile
+```
+
+### Integrity-gated bandwidth report
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 \
+  python3 scripts/p2p_bandwidth_bench.py --save p2p-report.txt
+```
+
+The benchmark first runs direct peer kernel reads/writes. It then reports the
+throughput of the `cudaMemcpyPeer` API and a pinned-host bounce baseline.
+`cudaMemcpyPeer` throughput is never labelled as proof of physical BAR1
+transport.
+
+### NCCL-only correctness test
+
+```bash
+source ~/venvs/vllm/bin/activate
+CUDA_VISIBLE_DEVICES=0,1 \
+NCCL_P2P_DISABLE=0 \
+NCCL_DEBUG=INFO \
+NCCL_DEBUG_SUBSYS=INIT,GRAPH,P2P,SHM \
+  python scripts/test_nccl_tp2.py
+```
+
+### Topology and ACS
+
+```bash
+nvidia-smi topo -m
+nvidia-smi topo -p2p r
+lspci -tv
+sudo lspci -vv | grep -E '^[0-9a-f]|LnkCap:|LnkSta:|ACSCtl:'
+```
+
+IOMMU passthrough is required by the upstream patch. ACS may force traffic
+upstream through the root complex and can destroy P2P performance or make a
+pair unusable. Prefer a BIOS/firmware ACS control. Kernel ACS override patches
+change isolation semantics and should not be applied blindly; the validator,
+not a topology label, decides whether a pair is accepted.
+
+## Why the vLLM check must remain enabled
+
+Current vLLM distinguishes between a driver's report and actual peer access:
+
+- With `VLLM_SKIP_P2P_CHECK=1`, vLLM calls
+  `torch.cuda.can_device_access_peer()` and **trusts the result**.
+- With `VLLM_SKIP_P2P_CHECK=0`, vLLM opens CUDA IPC memory across two processes,
+  mutates it from the peer GPU, verifies both views, and caches the result.
+
+See the upstream implementation:
+
+- [`vllm/envs.py`](https://github.com/vllm-project/vllm/blob/main/vllm/envs.py)
+- [`custom_all_reduce.py`](https://github.com/vllm-project/vllm/blob/main/vllm/distributed/device_communicators/custom_all_reduce.py)
+- [`all_reduce_utils.py`](https://github.com/vllm-project/vllm/blob/main/vllm/distributed/device_communicators/all_reduce_utils.py)
+
+A patched consumer driver is exactly the case where the real test is worth
+keeping.
+
+## File map
+
+| Path | Purpose |
 |---|---|
-| P2P Auto-detect | ~92 s (includes ~5 s P2P cache generation) |
-| P2P Disabled | ~86 s |
+| `install.py` | Exact-version, DKMS, GRUB, optional package-lock, and vLLM installer |
+| `scripts/p2p_probe.cu` | Direct peer kernel read/write data-integrity test |
+| `scripts/p2p_doctor.py` | Driver, boot, Ampere, kernel, CUDA IPC, NCCL, and profile gate |
+| `scripts/post-reboot-test.sh` | Reboot-time validation/profile wrapper |
+| `scripts/manage_vllm_safe_tp2.sh` | Validated launcher; supports TP count from visible devices |
+| `scripts/p2p_bandwidth_bench.py` | Integrity-gated benchmark/report wrapper |
+| `scripts/test_nccl_tp2.py` | Standalone NCCL correctness test for all visible GPUs |
+| `tests/` | Offline syntax and pure-function tests; no GitHub Actions required |
 
-### Takeaway
+## Recovery
 
-**Explicitly disabling P2P is 10–15% faster for typical workloads and up to
-40%+ faster under concurrent/long-sequence loads.** When you know your hardware
-can't do BAR P2P, tell NCCL upfront — it optimizes the SHM path more
-aggressively and avoids per-token fallback overhead.
+When validation fails, do not force the profile to `validated`. Work through the
+failed gate:
 
-For production use, set `NCCL_P2P_DISABLE=1` and `VLLM_SKIP_P2P_CHECK=1`. For
-initial validation, leave them at 0 to confirm auto-detection works, then switch.
+1. Confirm every driver layer is exactly `595.58.03`.
+2. Confirm the patched `Dual MIT/GPL` open module is the module selected by
+   `modinfo nvidia`.
+3. Confirm the running kernel was rebooted after DKMS installation.
+4. Confirm the CPU-specific IOMMU argument and `iommu=pt` are in
+   `/proc/cmdline`.
+5. Inspect slot topology, link width/speed, Above 4G Decoding, Resizable BAR,
+   and ACS controls in firmware.
+6. Re-run the direct kernel and CUDA IPC gates for the exact pair.
+7. Use `VLLM_P2P_MODE=shm` only as a clearly labelled fallback.
 
-## Key Findings
+Detailed procedures are in [`docs/`](docs/).
 
-### The Intel Root Complex Limitation
+## Security and maintenance
 
-Consumer Intel platforms (Alder Lake, Raptor Lake, etc.) have a root complex that
-cannot route BAR-mapped peer TLPs between different PCIe root ports. This is a
-**silicon-level limitation**, not fixable in software.
-
-What this means:
-- `cudaDeviceCanAccessPeer()` returns **true** (driver reports capability)
-- `cudaMemcpyPeer()` **works** (uses DMA staging through host RAM)
-- Direct BAR-mapped reads/writes from one GPU to another: **data corruption (NaN)**
-- CUDA IPC (cross-process BAR mapping): **fails**
-
-### NCCL Handles It Automatically
-
-NCCL probes transport capabilities at startup. When direct P2P fails, it
-automatically falls back to SHM (shared host memory) transport:
-
-```
-Channel 00 : 0[0] -> 1[1] via SHM/direct/direct
-```
-
-No environment variable overrides needed.
-
-### vLLM Handles It Automatically
-
-vLLM's `can_actually_p2p()` function tests CUDA IPC in separate processes.
-When it fails, vLLM disables custom all-reduce and delegates to NCCL:
-
-```
-Custom allreduce is disabled because your platform lacks GPU P2P capability
-or P2P test failed.
-```
-
-No flags needed.
-
-### ACS is Read-Only (and Irrelevant)
-
-Access Control Services (ACS) registers on Intel consumer root complexes are
-**read-only**. `setpci` writes succeed (exit 0) but the register reads back
-unchanged (`0xffff`). This is moot — since the root complex can't route P2P
-TLPs at all, ACS state doesn't matter.
-
-## When Would True BAR P2P Work?
-
-You'd need one of:
-1. **AMD Threadripper / EPYC** — their root complexes support P2P routing
-2. **Intel Xeon** (server platforms) — same
-3. **PLX/PEX PCIe switch** — all GPUs behind the same switch can do P2P
-4. **NVLink bridge** — directly connects GPUs (RTX 3090 supports this in pairs)
-
-Two GPUs on the **same CPU PEG controller** (e.g., 00:01.0 and 00:01.1) might
-theoretically support P2P, but this is untested and may still not work on
-consumer platforms.
-
-## Could True BAR P2P Help Performance?
-
-With NCCL P2P explicitly disabled (SHM-only transport), vLLM achieves
-**~43 ms TPOT** (23 tok/s per GPU) with the Qwen3.6-35B-A3B MoE model.
-That's ~231 tok/s aggregate throughput for sequential short prompts, and
-~227 tok/s for medium prompts — on two consumer RTX 3090s.
-
-True BAR P2P (e.g., behind a PLX switch or on Threadripper/EPYC) would:
-- Reduce per-token latency by eliminating the host RAM bounce
-- Enable vLLM's custom all-reduce kernel (lower-overhead than NCCL)
-- Likely improve concurrent throughput significantly (less host bus contention)
-
-On this Intel setup, the DMI 3.0 x4 link between CPU and PCH is the
-bottleneck for SHM transport when both GPUs are on PCH root ports.
-The two GPUs used for TP=2 here are GPU0 (CPU PEG) and GPU1 (PCH),
-so data crosses the DMI bridge on every all-reduce step.
-
-## Scripts
-
-| Script | Purpose |
-|---|---|
-| [`install.py`](install.py) | Interactive autoinstaller for the full setup |
-| [`scripts/manage_vllm_safe_tp2.sh`](scripts/manage_vllm_safe_tp2.sh) | Canonical vLLM launcher with boot arg gates |
-| [`scripts/require-gpu-pair.sh`](scripts/require-gpu-pair.sh) | Pre-flight check for TP=2 GPU pair |
-| [`scripts/post-reboot-test.sh`](scripts/post-reboot-test.sh) | Full post-reboot validation (boot args + NCCL test) |
-| [`scripts/test_nccl_tp2.py`](scripts/test_nccl_tp2.py) | Standalone NCCL all-reduce test |
-| [`scripts/p2p_bandwidth_bench.py`](scripts/p2p_bandwidth_bench.py) | **Full P2P + PCIe bandwidth benchmark** (compiles + runs CUDA benchmark, emits system report) |
-| [`scripts/p2p_bandwidth_bench.cu`](scripts/p2p_bandwidth_bench.cu) | CUDA benchmark source (unidirectional, bidirectional, latency, all GPU pairs) |
-
-## P2P Bandwidth Benchmark
-
-Run a full diagnostic across all GPU pairs:
-
-```bash
-python3 scripts/p2p_bandwidth_bench.py
-# optionally save results
-python3 scripts/p2p_bandwidth_bench.py --save bench_results.txt
-```
-
-The benchmark measures:
-- **Unidirectional bandwidth** at 1 / 16 / 64 / 256 MiB transfer sizes
-- **Bidirectional bandwidth** (simultaneous both directions)
-- **Round-trip latency** (4-byte ping, 200 rounds)
-- **Host↔Device baseline** per GPU
-- **P2P vs CPU-bounce comparison** for every pair where P2P is available
-
-It also prints a full system context header: driver version, PCIe link state
-(`lspci LnkSta`), `nvidia-smi topo`, and GPU inventory — so you can paste the
-entire output as a single reproducible report.
-
-### Why PCIe slot assignment matters
-
-On Intel consumer platforms the DMI link (CPU ↔ PCH) and the number of CPU-attached
-PEG lanes are both finite. A mixed 3090+3060 rig on Z690/B660 will typically end
-up with some cards on PCH root ports running at **x1** even though the slot is
-physically x16. Example from a real 5-GPU system:
-
-| GPU | Card | PCIe link | P2P bandwidth |
-|---|---|---|---|
-| GPU0 | RTX 3090 | Gen4 x8 (CPU PEG) | ~6.6 GB/s |
-| GPU1 | RTX 3090 | Gen4 x4 (PCH) | ~6.6 GB/s |
-| GPU2 | RTX 3060 | **Gen1 x1 (PCH)** | **~0.8 GB/s** |
-| GPU3 | RTX 3060 | **Gen1 x1 (PCH)** | **~0.8 GB/s** |
-| GPU4 | RTX 3090 | Gen4 x4 (CPU PEG) | ~6.6 GB/s |
-
-The 3060s physically support Gen3 x16 but the PCH slots were bandwidth-starved.
-The benchmark `[Summary & Recommendations]` section flags pairs below threshold
-and prints the relevant `lspci` command to investigate.
-
-**Fix**: move GPUs to CPU PEG slots, or use a PCIe bifurcation riser to give
-both cards at least x4 each from a single x16 slot.
+- `iommu=pt` weakens DMA isolation.
+- Patched kernel modules are not an NVIDIA-supported configuration.
+- Secure Boot requires a correctly enrolled signing key; the installer refuses
+  to assume this has been handled.
+- DKMS rebuild success must be checked after every kernel upgrade.
+- `--lock-driver` pins NVIDIA packages but deliberately leaves NCCL upgradeable.
+- A kernel or driver change invalidates the profile and requires revalidation.
+- Do not run the validator while production workloads are using the selected
+  GPUs; the tests allocate memory, create CUDA contexts, and execute peer writes.
 
 ## License
 
-This guide and all scripts are provided under the MIT License. The patched
-NVIDIA driver is subject to its own license (Dual MIT/GPL) — see
-[aikitoria/open-gpu-kernel-modules](https://github.com/aikitoria/open-gpu-kernel-modules).
+The guide and its original scripts are released under the repository license.
+The NVIDIA userspace driver and upstream NVIDIA/open-kernel-module sources keep
+their own licenses.
