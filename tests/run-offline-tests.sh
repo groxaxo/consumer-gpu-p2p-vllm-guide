@@ -4,8 +4,9 @@ set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-python3 -m compileall -q install.py scripts tests
+python3 -m compileall -q install.py install_core.py scripts tests
 bash -n scripts/manage_vllm_safe_tp2.sh
+bash -n scripts/manage_vllm_safe_tp2_core.sh
 bash -n scripts/post-reboot-test.sh
 python3 -m unittest discover -s tests -p 'test_*.py' -v
 
