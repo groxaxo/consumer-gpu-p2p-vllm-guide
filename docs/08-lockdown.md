@@ -1,107 +1,129 @@
-# Lockdown: Surviving `apt update && apt upgrade`
+# 8. Driver lifecycle and optional package lock
 
-The patched 595.58.03 P2P driver lives outside the apt package system, so two
-things can break it whenever you run `apt upgrade`:
+The patched kernel modules and NVIDIA userspace must remain version-aligned.
+DKMS and apt package policy solve different parts of that problem.
 
-1. **A new kernel** lands → the patched modules don't exist for the new
-   kernel → after reboot, the box drops to nouveau or no GPU.
-2. **An apt-installed nvidia/libnvidia package** lands (often as a dependency
-   of something else, e.g. `nvidia-container-toolkit`) → it drops a userspace
-   `libnvidia-ml.so` that doesn't match our kernel module → `nvidia-smi` fails
-   with "Driver/library version mismatch".
+## DKMS
 
-`install.py` solves **(1)** with DKMS and **(2)** with apt holds + an apt
-preferences pin. After the installer runs you can `apt update && apt upgrade`
-freely.
+The installer registers:
 
-## What the installer does
+```text
+nvidia-p2p/595.58.03
+```
 
-| Layer | Path | Effect |
-|---|---|---|
-| **DKMS registration** | `/usr/src/nvidia-p2p-595.58.03/`, `dkms status` | When apt installs any new kernel, the kernel postinst hook runs `dkms autoinstall` which rebuilds the patched `nvidia.ko`/`nvidia-uvm.ko`/`nvidia-modeset.ko`/`nvidia-drm.ko`/`nvidia-peermem.ko` against it before the next reboot. Modules are signed with the system MOK key so they load under Secure Boot. |
-| `apt-mark hold` on `libnccl2`, `libnccl-dev` | (dpkg state) | Newer NCCL releases (which can quietly disable P2P codepaths) can't land. |
-| `apt-mark hold` on every currently-installed `nvidia-*` / `libnvidia-*` package | (dpkg state) | Existing userspace packages are frozen at their current version. |
-| Apt preferences pin | `/etc/apt/preferences.d/00-nvidia-p2p-pin` | Any **new** `nvidia-driver-*`, `libnvidia-compute-*`, `linux-modules-nvidia-*`, etc. is given `Pin-Priority: -1` → apt refuses to install it even as a dependency. |
-| `.run` installer stash | `/opt/nvidia-p2p/NVIDIA-Linux-x86_64-595.58.03.run` | Survives `/home` cleanup. Re-run with `--no-kernel-modules` if userspace ever drifts. |
-| Healthcheck binary | `/usr/local/sbin/p2p-healthcheck` | One-shot verifier: matches `modinfo nvidia` ↔ `/proc/driver/nvidia/version` ↔ `nvidia-smi`, then prints the `topo -p2p r` matrix. |
+under:
 
-The kernel is **not** held — DKMS handles kernel upgrades automatically.
+```text
+/usr/src/nvidia-p2p-595.58.03
+```
 
-## Verifying
+Before rebooting after any kernel update:
 
 ```bash
-sudo p2p-healthcheck
+dkms status
 ```
 
-Expected:
+The new kernel must show the module as `installed`. A future kernel can break
+the pinned source build; DKMS is automation, not a compatibility guarantee.
 
-```
-kernel module version (modinfo): 595.58.03
-loaded kernel module (NVRM):     595.58.03
-nvidia-smi userspace:            595.58.03
-...
-OK: P2P driver healthy (595.58.03)
-```
-
-## Inspecting the locks
+Every running-kernel change invalidates the machine-bound P2P profile even when
+DKMS succeeds. Reboot and run:
 
 ```bash
-dkms status                                # should show nvidia-p2p/595.58.03, <kernel>: installed
-apt-mark showhold                          # all held packages
+CUDA_VISIBLE_DEVICES=0,1 bash scripts/post-reboot-test.sh
+```
+
+## Optional NVIDIA apt lock
+
+The installer no longer freezes NVIDIA and NCCL packages automatically. Global
+holds concealed mismatches and prevented unrelated NCCL fixes.
+
+After the exact driver stack is verified, opt in:
+
+```bash
+python3 install.py --lock-driver --yes
+```
+
+This:
+
+1. writes `/etc/apt/preferences.d/00-nvidia-p2p-pin` for NVIDIA driver/module
+   packages;
+2. holds currently installed `nvidia-*`, `libnvidia-*`, and Xorg NVIDIA
+   packages; and
+3. deliberately leaves `libnccl*` upgradeable.
+
+Inspect:
+
+```bash
 cat /etc/apt/preferences.d/00-nvidia-p2p-pin
-ls -la /opt/nvidia-p2p/
+apt-mark showhold | grep -E 'nvidia|libnvidia'
 ```
 
-## What happens on `apt upgrade`
+## Why NCCL is not pinned
 
-1. apt downloads a new `linux-image-X.Y.Z-generic` and `linux-headers-X.Y.Z-generic`.
-2. The kernel `postinst` hook fires `dkms autoinstall`.
-3. DKMS rebuilds `nvidia-p2p-595.58.03` against the new kernel, signs the
-   modules with your MOK key, and installs them to
-   `/lib/modules/X.Y.Z-generic/updates/dkms/`.
-4. `update-initramfs -u` is run automatically.
-5. After reboot the new kernel boots with the patched P2P driver loaded.
-
-If the DKMS build ever fails (e.g. NVIDIA source incompatible with a brand-new
-kernel), the build error appears in the apt output and `dkms status` shows the
-kernel without an "installed" entry. The OLD kernel still has its patched
-modules, so you can keep using it until you address the build failure.
-
-## Recovering from a broken userspace
-
-If `nvidia-smi` ever prints "Driver/library version mismatch" again (e.g. a
-co-located CUDA installer overwrote the libs), the kernel module is almost
-certainly still fine — just reinstall the matching userspace:
+The acceptance contract is exact-value collective correctness with P2P enabled,
+not a permanent NCCL version. After any NCCL/PyTorch/vLLM upgrade:
 
 ```bash
-sudo /opt/nvidia-p2p/NVIDIA-Linux-x86_64-595.58.03.run \
-     --no-kernel-modules --ui=none --silent
+CUDA_VISIBLE_DEVICES=0,1 \
+  bash scripts/manage_vllm_safe_tp2.sh revalidate
 ```
 
-No reboot needed. Re-run `sudo p2p-healthcheck` to confirm.
+If the transport or correctness changes, validation exposes it. Freezing NCCL
+without evidence is not a substitute for testing.
 
-## Intentionally upgrading the *NVIDIA driver* later
+## Runfile stash
 
-You **don't** need to do this for routine `apt upgrade` — those are safe.
-You only need to do this if you want to move to a different patched driver
-version:
+When an official runfile is supplied, the installer copies it to:
+
+```text
+/opt/nvidia-p2p/NVIDIA-Linux-x86_64-595.58.03.run
+```
+
+Recover matching userspace:
 
 ```bash
-# Free the userspace locks
-sudo rm /etc/apt/preferences.d/00-nvidia-p2p-pin
-sudo apt-mark unhold $(apt-mark showhold | grep -E 'nvidia|libnccl')
+sudo sh /opt/nvidia-p2p/NVIDIA-Linux-x86_64-595.58.03.run \
+  --silent --ui=none --no-questions --accept-license --no-kernel-modules
+sudo reboot
+```
 
-# Remove the DKMS module for the old version
+Do not run that command with a different patched kernel-module version.
+
+## Intentionally changing driver versions
+
+The patch is version-specific. To move away from 595.58.03:
+
+```bash
+# Remove apt policy/holds
+sudo rm -f /etc/apt/preferences.d/00-nvidia-p2p-pin
+held="$(apt-mark showhold | grep -E '^(nvidia|libnvidia|xserver-xorg-video-nvidia)' || true)"
+if [[ -n "$held" ]]; then
+  # shellcheck disable=SC2086
+  sudo apt-mark unhold $held
+fi
+
+# Remove patched DKMS modules
 sudo dkms remove -m nvidia-p2p -v 595.58.03 --all
 
-# Then install the new driver and re-run install.py to re-lock.
+# Remove old validation profiles and vLLM P2P caches only after stopping vLLM
+rm -f ~/.config/vllm/consumer-p2p.env
+rm -f ~/.cache/vllm/gpu_p2p_access_cache_for_*.json
 ```
 
-## Skipping lockdown
+Then install a fully matched new userspace/kernel stack. Do not reuse this
+profile or assume the old patch applies to the new driver.
 
-If you have your own kernel/driver lifecycle management (DKMS, salt, ansible),
-disable the lockdown step:
+## Secure Boot
+
+DKMS may create a signing key, but the kernel accepts it only when the key is
+enrolled and trusted. Verify rather than assuming:
 
 ```bash
-python3 install.py --skip-lockdown
+mokutil --sb-state
+modinfo -F signer nvidia
+journalctl -k -b | grep -Ei 'nvidia|signature|verification'
 ```
+
+The installer requires an explicit `--allow-secure-boot` opt-in after the
+operator has arranged signing/MOK enrollment.

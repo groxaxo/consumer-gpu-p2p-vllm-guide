@@ -1,223 +1,235 @@
 # 7. Troubleshooting
 
-## vLLM OOM during startup
-
-**Symptom**: Process dies with `CUDA out of memory` during "Capturing CUDA
-graphs" or model loading.
-
-**Fix**: Add `--enforce-eager` to disable CUDA graph capture, which requires
-extra memory for profiling. Optionally reduce utilization as well:
+Start with the failed line from:
 
 ```bash
---enforce-eager --gpu-memory-utilization 0.85
+CUDA_VISIBLE_DEVICES=0,1 \
+  ~/venvs/vllm/bin/python scripts/p2p_doctor.py validate \
+    --venv ~/venvs/vllm
 ```
 
-See [doc 04](04-vllm-setup.md#why---enforce-eager-is-hardcoded) for why this
-is needed on near-full VRAM configurations.
+Do not skip a failed gate and continue calling the result P2P-enabled.
 
----
+## Driver/userspace version mismatch
 
-## NCCL timeout or hang after model loads
+Symptoms:
 
-**Symptom**: vLLM loads the model successfully, then hangs indefinitely on the
-first inference request. NCCL prints timeout messages.
+- `nvidia-smi`: `Failed to initialize NVML: Driver/library version mismatch`
+- `modinfo nvidia` reports `595.58.03`, but `nvidia-smi` reports another version
+- the installer refuses to build the patch
 
-**Debug**:
+Compare all layers:
 
 ```bash
-NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=ALL \
-  CUDA_VISIBLE_DEVICES=0,1 ~/venvs/vllm/bin/vllm serve <model> \
-    --tensor-parallel-size 2 --enforce-eager
+modinfo -F version nvidia
+grep -E 'NVRM version|Kernel Module' /proc/driver/nvidia/version
+nvidia-smi --query-gpu=driver_version --format=csv,noheader
 ```
 
-Look for the transport line:
-
-- `via SHM/direct/direct` — correct, SHM transport is working
-- `via P2P/...` — NCCL thinks P2P works; on Intel consumer hardware this leads
-  to hangs or corruption
-
-**Fix**: Set `NCCL_P2P_DISABLE=1`. This tells NCCL to skip the P2P probe
-entirely and go straight to SHM transport. The production launcher already
-sets this by default.
-
-If the hang persists with `NCCL_P2P_DISABLE=1`, also verify:
-- `NCCL_SHM_DISABLE=0` (SHM transport must be enabled)
-- Sufficient `/dev/shm` space: `df -h /dev/shm` (should be several GiB free)
-- No other processes holding GPU memory: `nvidia-smi`
-
----
-
-## NaN outputs / garbled model responses
-
-**Symptom**: Model returns nonsensical text, all-zero outputs, or responses
-full of `nan`.
-
-**Cause 1 (most common)**: `RMForceP2PType=1` in modprobe config. This forces
-BAR-mapped P2P which silently corrupts tensors on Intel consumer platforms.
-
-**Fix**: Ensure `/etc/modprobe.d/nvidia.conf` contains:
-
-```
-options nvidia NVreg_RegistryDwords="RMForceP2PType=0"
-```
-
-Then rebuild initramfs and reboot:
+All must be exactly `595.58.03` after reboot. Reinstall matching userspace from
+the exact official runfile when necessary:
 
 ```bash
+sudo sh /opt/nvidia-p2p/NVIDIA-Linux-x86_64-595.58.03.run \
+  --silent --ui=none --no-questions --accept-license --no-kernel-modules
+sudo reboot
+```
+
+The reboot is required when the loaded kernel module was a different version.
+
+## Patched module built but stock module loads
+
+Inspect module paths and license:
+
+```bash
+modinfo -n nvidia
+modinfo -F version nvidia
+modinfo -F license nvidia
+dkms status
+find /lib/modules/"$(uname -r)" -name 'nvidia*.ko*' -print
+```
+
+Expected license is `Dual MIT/GPL`, and the DKMS status must show the current
+kernel installed. Rebuild dependency maps and initramfs:
+
+```bash
+sudo depmod -a
 sudo update-initramfs -u
 sudo reboot
 ```
 
-Verify after reboot:
+If an apt `nvidia-dkms-*` package keeps replacing the module, remove the
+conflict or use the installer's explicit `--lock-driver` mode after the exact
+stack is working.
+
+## Boot configuration fails
 
 ```bash
-cat /proc/driver/nvidia/params | grep RMForceP2PType
-# Expected: RMForceP2PType: 0
-```
-
-**Cause 2**: Both `NCCL_P2P_DISABLE=1` and `NCCL_SHM_DISABLE=1` are set.
-This disables all NCCL transports, preventing all-reduce from completing.
-
-**Fix**: Remove `NCCL_SHM_DISABLE=1` (or set it to `0`). The correct
-production config has `NCCL_P2P_DISABLE=1` and `NCCL_SHM_DISABLE=0`.
-
----
-
-## `cudaDeviceCanAccessPeer` returns false
-
-**Symptom**: P2P capability tests report "peer access is not supported between
-GPU0 and GPU1". NCCL may not initialize multi-GPU at all.
-
-**Cause**: Stock NVIDIA driver (not the patched open modules). The stock driver
-disables P2P reporting for consumer GPUs.
-
-**Fix**: Install the patched driver and verify:
-
-```bash
-modinfo nvidia | grep -E "version|license"
-# version:        595.58.03
-# license:        Dual MIT/GPL
-```
-
-If the license shows `NVIDIA` (proprietary) instead of `Dual MIT/GPL` (open
-modules), the patched driver is not loaded. See [doc 02](02-patched-driver.md).
-
----
-
-## "Custom allreduce is disabled" message in vLLM logs
-
-This is **expected and correct** on Intel consumer platforms. It means vLLM
-ran its `can_actually_p2p()` IPC test, caught the CUDA IPC failure, and
-delegated all-reduce to NCCL. Do not try to force-enable custom all-reduce —
-NCCL SHM transport is used instead and works correctly.
-
----
-
-## PCIe errors in dmesg
-
-**Symptom**: `AER: Corrected error received`, `BadTLP`, or `RxErr` messages
-appear in `dmesg` or `/var/log/syslog`.
-
-**Cause**: Signal integrity issues with riser cables, cards running at
-reduced PCIe link speeds, or simply the high PCIe traffic from DMA copies.
-These errors typically do not affect operation when using SHM transport.
-
-**Fix**: Add `pci=noaer` to GRUB kernel args to suppress the log spam:
-
-```
-GRUB_CMDLINE_LINUX_DEFAULT="quiet splash intel_iommu=on iommu=pt pci=noaer pcie_aspm=off"
-```
-
-If errors are severe and reproducible, reseat the GPU cards and risers.
-
----
-
-## Model loads but produces wrong answers
-
-**Debug**:
-
-```bash
-# Verify NCCL all-reduce produces correct values
-CUDA_VISIBLE_DEVICES=0,1 python3 scripts/test_nccl_tp2.py
-```
-
-If the all-reduce test fails or produces wrong values, the SHM path is broken.
-Check:
-
-1. Sufficient system RAM: `free -h` — NCCL SHM needs a few GiB
-2. `/dev/shm` is not full: `df -h /dev/shm`
-3. No other processes consuming GPU memory: `nvidia-smi`
-4. `RMForceP2PType=0` is set (see NaN outputs section above)
-
----
-
-## GRUB changes not taking effect after reboot
-
-**Fix**:
-
-```bash
-# Regenerate GRUB config
-sudo update-grub
-
-# Reboot
-sudo reboot
-
-# After reboot — verify the args are present
 cat /proc/cmdline
-# Should contain: intel_iommu=on iommu=pt
+find /sys/kernel/iommu_groups -mindepth 1 -maxdepth 1 -type d | wc -l
 ```
 
-If you're on UEFI and the changes still don't take effect, verify GRUB is
-the active bootloader:
+Required:
+
+- Intel: `intel_iommu=on iommu=pt`
+- AMD: `amd_iommu=on iommu=pt`
+- populated IOMMU groups
+
+Regenerate GRUB and reboot:
 
 ```bash
-sudo efibootmgr
-# GRUB should appear as the first active entry
+sudo update-grub
+sudo reboot
 ```
 
----
+The guide no longer hides PCIe errors with `pci=noaer`. AER messages are useful
+evidence; fix the link/riser/slot issue rather than suppressing it.
 
-## Driver not loading after a kernel upgrade
+## Direct kernel peer read/write fails
 
-If you installed the driver without DKMS, the modules won't exist for the new
-kernel. With the installer's DKMS setup this shouldn't happen, but if it does:
+A capability report of `1` followed by `read=FAIL` or `write=FAIL` means the
+mapping is advertised but not correct. Do not set `VLLM_SKIP_P2P_CHECK=1`.
+
+Collect:
 
 ```bash
-# Check DKMS status
-dkms status
-# Should show: nvidia-p2p/595.58.03, <new-kernel>: installed
-
-# If missing, rebuild manually
-sudo dkms build -m nvidia-p2p -v 595.58.03 -k $(uname -r)
-sudo dkms install -m nvidia-p2p -v 595.58.03 -k $(uname -r)
-
-# Reload
-sudo rmmod nvidia_drm nvidia_modeset nvidia_uvm nvidia 2>/dev/null || true
-sudo modprobe nvidia
-modinfo nvidia | grep version
-# version:        595.58.03
+nvidia-smi topo -m
+nvidia-smi topo -p2p r
+lspci -tv
+sudo lspci -vv -s <each-GPU-BDF> | grep -E 'LnkCap:|LnkSta:|ACSCtl:'
+journalctl -k -b | grep -Ei 'NVRM|Xid|AER|BadTLP|Unsupported Request'
 ```
 
-See [doc 08](08-lockdown.md) for the full lockdown setup that prevents this.
+Then check:
 
----
+1. both cards use CPU-connected slots when possible;
+2. slot bifurcation matches the board layout;
+3. Above 4G Decoding is enabled;
+4. ACS firmware settings do not force an unusable route;
+5. risers are stable at the negotiated generation/width;
+6. forcing Gen3 removes signal-integrity errors;
+7. an RTX 3090 NVLink bridge is correctly seated when that path is intended.
 
-## "Driver/library version mismatch" from nvidia-smi
+If the platform cannot route the pair correctly, use a different pair or the
+explicit SHM fallback. Software cannot validate corrupted hardware traffic into
+correctness.
 
-**Symptom**: `nvidia-smi` prints "Failed to initialize NVML: Driver/library
-version mismatch".
+## vLLM CUDA IPC fails while direct kernel access passes
 
-**Cause**: A package manager update replaced the userspace NVIDIA libraries
-with a version that doesn't match the patched 595.58.03 kernel module.
-
-**Fix**: Reinstall the matching userspace without touching the kernel modules:
+This narrows the issue to cross-process CUDA IPC/runtime behavior. Remove only
+the profile-specific vLLM cache and regenerate it:
 
 ```bash
-sudo /opt/nvidia-p2p/NVIDIA-Linux-x86_64-595.58.03.run \
-     --no-kernel-modules --ui=none --silent
+find ~/.cache/vllm -maxdepth 1 -name 'gpu_p2p_access_cache_for_*.json' -print
+rm ~/.cache/vllm/gpu_p2p_access_cache_for_<exact-device-key>.json
+
+CUDA_VISIBLE_DEVICES=0,1 \
+VLLM_SKIP_P2P_CHECK=0 \
+  ~/venvs/vllm/bin/python scripts/p2p_doctor.py validate \
+    --venv ~/venvs/vllm
 ```
 
-No reboot needed. Verify with `nvidia-smi` and `sudo p2p-healthcheck`.
+Do not delete every cache on each start. The cache is keyed by the visible
+device mapping and is useful once a pair has passed.
 
-If the `.run` file isn't at that path, see [doc 08](08-lockdown.md) for how
-the installer stashes it.
+Check for mixed CUDA libraries:
+
+```bash
+~/venvs/vllm/bin/python - <<'PY'
+import torch
+print(torch.__version__, torch.version.cuda)
+print(torch.cuda.get_device_name(0))
+PY
+
+echo "$LD_LIBRARY_PATH"
+ldd ~/venvs/vllm/lib/python*/site-packages/torch/lib/libtorch_cuda.so | grep -E 'cuda|nccl'
+```
+
+## NCCL exact-value test fails
+
+Run the standalone test with logs:
+
+```bash
+source ~/venvs/vllm/bin/activate
+CUDA_VISIBLE_DEVICES=0,1 \
+NCCL_P2P_DISABLE=0 \
+NCCL_SHM_DISABLE=0 \
+NCCL_DEBUG=INFO \
+NCCL_DEBUG_SUBSYS=INIT,GRAPH,P2P,SHM \
+  python scripts/test_nccl_tp2.py 2>&1 | tee /tmp/nccl-p2p.log
+```
+
+Investigate the first NCCL or CUDA error, not only the final timeout. Check for
+another workload on the selected GPUs and for stale processes:
+
+```bash
+nvidia-smi
+ps -ef | grep -E '[v]llm|[t]orchrun|[p]ython.*nccl'
+```
+
+When direct peer and CUDA IPC pass but NCCL explicitly selects SHM, keep the
+result labelled as SHM. Strict profile generation rejects that state unless
+`--allow-nccl-shm` is deliberately supplied.
+
+## vLLM logs “custom all-reduce is disabled”
+
+Interpret the reason:
+
+- **world size 3**: expected; vLLM custom all-reduce does not support TP=3.
+  NCCL can still use validated P2P.
+- **P2P test failed**: not expected for a validated TP=2 profile. Re-run the
+  doctor and inspect the vLLM IPC gate.
+- **more than two PCIe-only GPUs / not fully connected**: vLLM may choose NCCL
+  even when individual peer pairs work.
+
+Do not suppress the message without understanding which branch produced it.
+
+## vLLM OOM during graph capture
+
+P2P can be correct while the model still lacks graph-capture headroom. Use:
+
+```bash
+VLLM_ENFORCE_EAGER=1 \
+VLLM_GPU_MEMORY_UTILIZATION=0.88 \
+  bash scripts/manage_vllm_safe_tp2.sh restart <model-id>
+```
+
+Then tune memory utilization and context independently of P2P.
+
+## Profile is stale
+
+This is intentional after a kernel, driver, boot, GPU-order, slot, or selected
+set change. Regenerate:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 \
+  bash scripts/manage_vllm_safe_tp2.sh revalidate
+```
+
+Never hand-edit the fingerprint to bypass testing.
+
+## Port is occupied
+
+The launcher refuses to adopt or kill an unmanaged listener:
+
+```bash
+sudo lsof -nP -iTCP:8000 -sTCP:LISTEN
+ps -fp <pid>
+```
+
+Stop that service explicitly or choose another port:
+
+```bash
+VLLM_PORT=8001 bash scripts/manage_vllm_safe_tp2.sh start <model-id>
+```
+
+## Emergency SHM fallback
+
+```bash
+VLLM_P2P_MODE=shm \
+  bash scripts/manage_vllm_safe_tp2.sh start <model-id>
+```
+
+This is designed to preserve correct inference while P2P is repaired. It is not
+a successful P2P outcome and should be benchmarked against single-GPU or other
+parallelism strategies.

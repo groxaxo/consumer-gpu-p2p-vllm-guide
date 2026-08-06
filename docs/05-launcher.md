@@ -1,156 +1,135 @@
-# 5. Production Launcher Script
+# 5. Profile-gated vLLM launcher
 
-The canonical launcher is `scripts/manage_vllm_safe_tp2.sh`. It enforces boot
-args, manages PID files, handles stale processes, and refuses to adopt
-unmanaged vLLM instances.
+`scripts/manage_vllm_safe_tp2.sh` keeps its original filename for compatibility,
+but it now supports the visible GPU count rather than hardcoding two GPUs.
 
-## Design Principles
+## Safety invariants
 
-1. **Hard-fail on missing prerequisites** — if the required boot args aren't
-   present, the script exits with a clear error rather than launching into a
-   broken state.
-2. **Never adopt unmanaged processes** — if a vLLM process is already listening
-   on the configured port but wasn't started by this script, the start command
-   refuses. This prevents config bypass by background processes.
-3. **Single source of truth** — all NCCL, transport, and model flags are set
-   here. You don't need to pass env vars manually.
-4. **Production transport defaults** — `NCCL_P2P_DISABLE=1` and
-   `VLLM_SKIP_P2P_CHECK=1` are on by default. These skip P2P probing entirely
-   and give 10–15% better TPOT than letting NCCL probe and fall back. Set
-   either to `0` to validate the auto-detect path. `--disable-custom-all-reduce`
-   is never passed — vLLM disables it automatically when P2P is unavailable.
+The launcher:
 
-## Usage
+1. requires a machine-bound P2P profile in `validated` mode;
+2. checks the profile against the current driver, loaded kernel, boot arguments,
+   GPU UUIDs, PCI bus IDs, selected order, and expected transport variables;
+3. leaves vLLM's real CUDA IPC checker enabled;
+4. never deletes vLLM's P2P cache during an ordinary start;
+5. never adopts or kills an unmanaged process on the configured port;
+6. runs vLLM in its own process group so managed worker processes stop together;
+7. labels SHM fallback as SHM and disables vLLM custom all-reduce in that mode.
+
+## Commands
 
 ```bash
-# Start with default model (Qwen/Qwen3.5-9B)
-bash scripts/manage_vllm_safe_tp2.sh start
+# Run validation without writing a profile
+CUDA_VISIBLE_DEVICES=0,1 \
+  bash scripts/manage_vllm_safe_tp2.sh validate
 
-# Start with a different model
-bash scripts/manage_vllm_safe_tp2.sh start Qwen/Qwen3.6-35B-A3B-FP8
+# Validate and write/update the profile
+CUDA_VISIBLE_DEVICES=0,1 \
+  bash scripts/manage_vllm_safe_tp2.sh revalidate
 
-# Start with extra vLLM flags (appended after the model)
-bash scripts/manage_vllm_safe_tp2.sh start Qwen/Qwen3.6-35B-A3B-FP8 --max-model-len 16384
+# Start
+CUDA_VISIBLE_DEVICES=0,1 \
+  bash scripts/manage_vllm_safe_tp2.sh start <model-id>
 
-# Other commands
-bash scripts/manage_vllm_safe_tp2.sh stop
-bash scripts/manage_vllm_safe_tp2.sh restart
-bash scripts/manage_vllm_safe_tp2.sh status
-bash scripts/manage_vllm_safe_tp2.sh health
+# Add model-specific vLLM flags
+CUDA_VISIBLE_DEVICES=0,1 \
+  bash scripts/manage_vllm_safe_tp2.sh start <model-id> \
+    --max-num-seqs 8
+
+# Lifecycle
+bash scripts/manage_vllm_safe_tp2.sh status <model-id>
+bash scripts/manage_vllm_safe_tp2.sh health <model-id>
+bash scripts/manage_vllm_safe_tp2.sh restart <model-id>
+bash scripts/manage_vllm_safe_tp2.sh stop <model-id>
+
+# Show the selected profile and transport values
+bash scripts/manage_vllm_safe_tp2.sh transport
 ```
 
-## Environment Overrides
+## P2P modes
 
-These can be exported before running the script to change its defaults:
+### Validated — default
 
 ```bash
-VLLM_MODEL=Qwen/Qwen3.5-9B            # model to serve
-VLLM_PORT=8000                         # port (default 8000)
-VLLM_HOST=127.0.0.1                    # bind address
-VLLM_MAX_MODEL_LEN=32768               # max context length
-VLLM_GPU_MEMORY_UTILIZATION=0.92       # fraction of VRAM to allocate
-CUDA_VISIBLE_DEVICES=0,1               # GPU pair to use
-VLLM_VENV_PATH=~/venvs/vllm            # path to vLLM virtualenv
-VLLM_LOG_DIR=~/logs                    # where vllm stdout/stderr is written
-VLLM_RUN_DIR=~/.run                    # PID file directory
-VLLM_STARTUP_TIMEOUT_SECONDS=180       # seconds to wait for /health to respond
-
-# Feature toggles
-VLLM_USE_QWEN_TOOLING_DEFAULTS=1       # add Qwen3 parser/tool flags (see below)
-VLLM_USE_UNSLOTH_DEFAULTS=1            # add prefix caching + batching flags
-VLLM_UNSLOTH_ARGS=""                   # override the built-in Unsloth defaults
-
-# Transport / P2P
-NCCL_P2P_DISABLE=1                     # 1 = skip P2P probe (default, faster)
-                                        # 0 = let NCCL probe (for validation)
-VLLM_SKIP_P2P_CHECK=1                  # 1 = skip vLLM P2P cache gen (default)
-                                        # 0 = run vLLM's IPC test (for validation)
-
-# MoE
-VLLM_MOE_BACKEND=marlin                # force a specific MoE kernel backend
-                                        # omit to use auto-detection (see below)
+VLLM_P2P_MODE=validated
 ```
 
-## Startup Flow
+Startup fails when the profile is missing or stale. Regenerate it after a
+kernel, driver, GPU order, slot, or firmware/boot change.
 
-```
-start command
-  ├─ remove_pid_file_if_stale()          — clean up leftover PID from last crash
-  ├─ already running?                    → exit 0 (idempotent)
-  ├─ unmanaged vLLM on same port?        → REFUSE (prevents config bypass)
-  ├─ require_p2p_boot_args()
-  │   ├─ intel_iommu=on in /proc/cmdline → REFUSE if missing
-  │   └─ iommu=pt in /proc/cmdline       → REFUSE if missing
-  ├─ clear vLLM P2P cache files          — stale cache can cause 5s startup delay
-  └─ launch vllm serve
-      ├─ NCCL_P2P_DISABLE=1   (default; set to 0 to validate auto-detect)
-      ├─ NCCL_IB_DISABLE=1
-      ├─ NCCL_SHM_DISABLE=0
-      ├─ VLLM_SKIP_P2P_CHECK=1 (default; set to 0 to validate)
-      ├─ --enforce-eager        (prevents OOM on CUDA graph capture)
-      └─ --tensor-parallel-size 2
+### Auto — diagnostic
+
+```bash
+VLLM_P2P_MODE=auto
 ```
 
-## Qwen-Specific Flags
+The launcher enables NCCL P2P and vLLM's actual checker but does not require a
+saved profile. This is useful while collecting evidence; it is not the default
+production contract.
 
-When the model is `Qwen/Qwen3.5-9B` (the default) and
-`VLLM_USE_QWEN_TOOLING_DEFAULTS=1` (the default), the launcher adds:
+### SHM — recovery
 
-```
---reasoning-parser qwen3
---enable-auto-tool-choice
---tool-call-parser qwen3_coder
---language-model-only
+```bash
+VLLM_P2P_MODE=shm
 ```
 
-**What these do:**
+The launcher sets:
 
-- `--reasoning-parser qwen3` — enables parsing of Qwen3's chain-of-thought
-  `<think>...</think>` blocks from the output.
-- `--enable-auto-tool-choice` — allows the model to call tools based on user
-  intent, without requiring the client to explicitly pass `tool_choice`.
-- `--tool-call-parser qwen3_coder` — uses Qwen3's specific tool call output
-  format (JSON-in-special-tokens) rather than the generic OpenAI format.
-- `--language-model-only` — Qwen3.5-9B is a vision-language checkpoint that
-  includes vision encoder weights. This flag tells vLLM to load only the
-  language model weights, skipping the vision encoder. Saves memory and
-  eliminates image-token processing overhead when you're only doing text.
+```bash
+NCCL_P2P_DISABLE=1
+NCCL_SHM_DISABLE=0
+VLLM_SKIP_P2P_CHECK=0
+```
 
-Set `VLLM_USE_QWEN_TOOLING_DEFAULTS=0` to disable all of these even for the
-default model (e.g. when using the model through a client that handles tool
-parsing itself).
+and adds `--disable-custom-all-reduce`. This prevents a broken peer route from
+being used. It also means the run is not P2P-enabled.
 
-## Unsloth Performance Defaults
+## Environment reference
 
-When `VLLM_USE_UNSLOTH_DEFAULTS=1` (the default), the launcher adds vLLM
-flags optimized for throughput:
+| Variable | Default | Meaning |
+|---|---:|---|
+| `CUDA_VISIBLE_DEVICES` | `0,1` | Exact GPU identifiers and order to expose |
+| `VLLM_TENSOR_PARALLEL_SIZE` | visible count | Tensor-parallel world size |
+| `VLLM_P2P_MODE` | `validated` | `validated`, `auto`, or `shm` |
+| `P2P_PROFILE_PATH` | `~/.config/vllm/consumer-p2p.env` | Machine-bound profile |
+| `VLLM_VENV_PATH` | `~/venvs/vllm` | Runtime environment |
+| `VLLM_MODEL` | `Qwen/Qwen3.5-9B` | Default model when omitted |
+| `VLLM_HOST` | `0.0.0.0` | API bind address |
+| `VLLM_PORT` | `8000` | API port |
+| `VLLM_MAX_MODEL_LEN` | `32768` | Maximum context |
+| `VLLM_GPU_MEMORY_UTILIZATION` | `0.92` | vLLM memory allocation target |
+| `VLLM_ENFORCE_EAGER` | `1` | Disable graph capture when set |
+| `VLLM_LOG_DIR` | `~/.local/state/vllm` | Logs |
+| `VLLM_RUN_DIR` | XDG runtime/cache path | PID files |
+| `VLLM_STARTUP_TIMEOUT_SECONDS` | `300` | Health wait limit |
+| `VLLM_MOE_BACKEND` | unset | Optional explicit MoE backend |
+| `VLLM_USE_QWEN_TOOLING_DEFAULTS` | `1` | Default-model parser flags |
+| `VLLM_USE_UNSLOTH_DEFAULTS` | `1` | Prefix cache/batching defaults |
+| `VLLM_UNSLOTH_ARGS` | unset | Replacement operator-supplied CLI args |
 
-- Prefix caching (`--enable-prefix-caching`) — reuses KV cache across requests
-  that share a common system prompt, reducing TTFT for multi-turn conversations.
-- Chunked prefill tuning — better batching of prefill and decode phases.
+The launcher does not accept `NCCL_P2P_DISABLE` or `VLLM_SKIP_P2P_CHECK` as
+unsafe overrides in validated mode; the checked profile is the source of truth.
 
-Set `VLLM_USE_UNSLOTH_DEFAULTS=0` to disable. Set `VLLM_UNSLOTH_ARGS="..."` to
-completely replace the built-in Unsloth defaults with your own flags.
+## Profile lifecycle
 
-## MoE Backend Auto-Detection
+The profile contains no secret. Its mode is `0600` because it is executable
+shell configuration and should not be writable by another local user.
 
-vLLM supports multiple backends for Mixture-of-Experts routing kernels. The
-launcher adds `--moe-backend marlin` automatically only when the model looks
-like a **quantized MoE** model — specifically, when the model name contains
-both:
+It is intentionally invalidated by:
 
-1. An active-parameter suffix: `-A3B`, `-A22B`, `-A47B`, etc. (the number of
-   active params in the MoE sparse forward pass)
-2. A quantization token: `FP8`, `GPTQ`, `AWQ`, `INT4`, `INT8`, `W4`, `W8`, `BNB`
+- running-kernel change;
+- NVIDIA driver version change;
+- GPU UUID, bus, or order change;
+- selected device-list change;
+- missing IOMMU passthrough boot state; or
+- edits that turn P2P or vLLM verification off.
 
-Examples:
-- `Qwen3.6-35B-A3B-FP8` → quantized MoE → `--moe-backend marlin` added
-- `Qwen3.5-9B` → dense model → no MoE backend flag
-- `Qwen3.6-35B-A3B` → MoE but not quantized → no flag (uses vLLM default)
+Revalidate:
 
-Marlin is a high-performance quantized matmul kernel tuned for A100/3090-class
-GPUs. On unquantized (full-precision) MoE models, Marlin is not needed and the
-flag is omitted.
+```bash
+CUDA_VISIBLE_DEVICES=0,1 \
+P2P_PROFILE_PATH=~/.config/vllm/p2p-0-1.env \
+  bash scripts/manage_vllm_safe_tp2.sh revalidate
+```
 
-Set `VLLM_MOE_BACKEND=<value>` to force a specific backend regardless of
-auto-detection, or leave it unset to let the launcher decide.
+Use the same variables to launch.
