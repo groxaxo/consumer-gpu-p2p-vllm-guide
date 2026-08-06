@@ -68,6 +68,22 @@ class InstallerTests(unittest.TestCase):
             self.assertIn(f'="{module}"', config)
         self.assertIn('PACKAGE_VERSION="595.58.03"', config)
 
+    def test_python_runtime_pin_matches_vllm_cuda_variant(self) -> None:
+        self.assertEqual(
+            installer.TORCH_INDEX_URL,
+            "https://download.pytorch.org/whl/cu129",
+        )
+        self.assertEqual(
+            installer.PYTHON_PACKAGES,
+            (
+                "torch==2.11.0+cu129",
+                "torchvision==0.26.0+cu129",
+                "torchaudio==2.11.0+cu129",
+                "vllm==0.21.0",
+            ),
+        )
+        self.assertIs(installer._core.install_vllm, installer.install_vllm)
+
 
 class DoctorTests(unittest.TestCase):
     def test_normalize_devices(self) -> None:
