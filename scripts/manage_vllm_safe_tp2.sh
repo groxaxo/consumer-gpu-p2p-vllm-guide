@@ -20,7 +20,9 @@ IFS=',' read -r -a RAW_DEVICE_ARRAY <<< "$RAW_DEVICES"
 declare -A SEEN_DEVICES=()
 NORMALIZED_DEVICES=()
 for raw_device in "${RAW_DEVICE_ARRAY[@]}"; do
-  device="${raw_device//[[:space:]]/}"
+  device="$raw_device"
+  device="${device#"${device%%[![:space:]]*}"}"
+  device="${device%"${device##*[![:space:]]}"}"
   [[ "$device" =~ ^[0-9]+$ ]] || {
     echo "CUDA_VISIBLE_DEVICES must contain numeric physical GPU indices; got: $raw_device" >&2
     exit 64
